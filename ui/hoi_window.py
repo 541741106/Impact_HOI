@@ -5201,28 +5201,26 @@ class HOIWindow(FrameControlMixin, QWidget):
             loaded_count = 0
             with open(fp, "r", encoding="utf-8") as f:
                 for line in f:
-                    parts = line.strip().split(",")
-                    if len(parts) != 2:
+                    category = line.strip()
+                    if not category:
                         continue
-                    category, count = parts[0].strip(), int(parts[1].strip())
+                    
+                    entity_name = category
 
-                    for i in range(1, count + 1):
-                        entity_name = f"{category}_{i}"
+                    if entity_name in self.global_object_map:
+                        uid = self.global_object_map[entity_name]
+                    else:
+                        uid = self.object_id_counter
+                        self.global_object_map[entity_name] = uid
+                        self.object_id_counter += 1
 
-                        if entity_name in self.global_object_map:
-                            uid = self.global_object_map[entity_name]
-                        else:
-                            uid = self.object_id_counter
-                            self.global_object_map[entity_name] = uid
-                            self.object_id_counter += 1
+                    self.id_to_category[entity_name] = category
 
-                        self.id_to_category[entity_name] = category
+                    display_text = f"[{uid}] {entity_name}"
 
-                        display_text = f"[{uid}] {entity_name}"
-
-                        if combo.findData(uid) == -1:
-                            combo.addItem(display_text, uid)
-                            loaded_count += 1
+                    if combo.findData(uid) == -1:
+                        combo.addItem(display_text, uid)
+                        loaded_count += 1
 
             QMessageBox.information(
                 self,
