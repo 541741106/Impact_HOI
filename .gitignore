@@ -22,6 +22,7 @@ __pycache__/
 *.pyc
 
 # ===== Local data / outputs =====
+incremental_train/
 .cvhci_local/
 external/
 test_data/
