@@ -49,7 +49,7 @@ class HOITimelineRow(BaseTimelineRow):
         self._on_hover = on_hover
 
         self.setMouseTracking(True)
-        self.setMinimumHeight(44)
+        self.setMinimumHeight(48)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self._selected_event_id: Optional[int] = None
@@ -65,7 +65,16 @@ class HOITimelineRow(BaseTimelineRow):
         self._grab_offset = 0
 
     def sizeHint(self) -> QSize:
-        return QSize(900, 44)
+        return QSize(900, 48)
+
+    def _row_font(self, delta: float = 0.0, weight: int = QFont.Normal) -> QFont:
+        font = QFont(self.font())
+        size = font.pointSizeF()
+        if size <= 0:
+            size = 9.0
+        font.setPointSizeF(max(7.5, size + delta))
+        font.setWeight(weight)
+        return font
 
     def set_selected(self, event_id: Optional[int]):
         if self._selected_event_id != event_id:
@@ -142,8 +151,14 @@ class HOITimelineRow(BaseTimelineRow):
 
     def paintEvent(self, _e):
         p = QPainter(self)
-        bg = QColor(240, 240, 240)
-        p.fillRect(self.rect(), bg)
+        row_selected = self._selected_event_id is not None
+        accent = QColor("#2563EB")
+        row_bg = QColor("#EFF6FF") if row_selected else QColor("#F8FAFC")
+        gutter_bg = QColor("#DBEAFE") if row_selected else QColor("#EEF2F6")
+        p.fillRect(self.rect(), row_bg)
+        p.fillRect(QRect(0, 0, self.get_gutter(), self.height()), gutter_bg)
+        if row_selected:
+            p.fillRect(QRect(0, 0, 4, self.height()), accent)
 
         start = self.get_vs()
         span = self.get_span()
@@ -165,27 +180,33 @@ class HOITimelineRow(BaseTimelineRow):
             color = seg.get("color") or self._get_color(seg.get("verb", ""))
             if isinstance(color, str):
                 color = QColor(color)
-            fill = QColor(color)
-            p.setBrush(QBrush(fill.lighter(105)))
             sel = seg.get("event_id") == self._selected_event_id
-            p.setPen(QPen(color.darker(140), 3 if sel else 1))
-            p.drawRoundedRect(rect, 4, 4)
+            fill = QColor(color).lighter(112 if sel else 108)
+            outline = accent if sel else color.darker(140)
+            p.setBrush(QBrush(fill))
+            p.setPen(QPen(outline, 3 if sel else 1))
+            p.drawRoundedRect(rect, 5, 5)
+
+            if sel:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor(255, 255, 255, 120), 1))
+                p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
 
             if seg.get("verb"):
-                p.setPen(QPen(QColor(40, 40, 40)))
-                p.setFont(QFont("Arial", 8))
+                p.setPen(QPen(QColor("#101828") if sel else QColor("#344054")))
+                p.setFont(self._row_font(-1.0, QFont.DemiBold if sel else QFont.Medium))
                 text = str(seg.get("verb"))
                 elided = p.fontMetrics().elidedText(
-                    text, Qt.ElideRight, rect.width() - 8
+                    text, Qt.ElideRight, max(0, rect.width() - 8)
                 )
                 p.drawText(
                     rect.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignVCenter, elided
                 )
 
-            # onset marker
             if onset is not None:
                 onset_x = self.frame_to_x(onset)
-                p.setPen(QPen(color.darker(160), 2))
+                marker_color = accent if sel else color.darker(160)
+                p.setPen(QPen(marker_color, 2))
                 p.drawLine(onset_x, rect.top(), onset_x, rect.bottom())
                 tri = QPolygon(
                     [
@@ -194,10 +215,9 @@ class HOITimelineRow(BaseTimelineRow):
                         QPoint(onset_x + 4, rect.top() + 6),
                     ]
                 )
-                p.setBrush(QBrush(color.darker(160)))
+                p.setBrush(QBrush(marker_color))
                 p.drawPolygon(tri)
 
-        # preview interval
         if self._preview_interval is not None:
             s, e = self._preview_interval
             s_vis = max(s, start)
@@ -219,6 +239,9 @@ class HOITimelineRow(BaseTimelineRow):
         if self._hover_frame is not None and start <= self._hover_frame <= end:
             label = f"F {self._hover_frame} | {self._hover_frame / fps:.2f}s"
             self._draw_hover_marker(p, start, end, fps, label)
+
+        p.setPen(QPen(QColor("#D0D5DD"), 1))
+        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
 
     def mouseMoveEvent(self, e):
         g = self.get_gutter()
@@ -393,7 +416,7 @@ class HOITimeline(QWidget):
         self._get_title = get_title_for_hand
         self._view_start = 0
         self._view_span: Optional[int] = None
-        self._gutter_px = 90
+        self._gutter_px = 118
         self._block_view_signal = False
         self._user_span_override = False
         self._selected_event_id: Optional[int] = None
@@ -422,15 +445,27 @@ class HOITimeline(QWidget):
 
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
-        controls.addWidget(QLabel("View start:"))
+        controls.setSpacing(6)
+        self.lbl_timeline_caption = QLabel("Timeline")
+        self.lbl_timeline_caption.setStyleSheet("color: #344054; font-weight: 600;")
+        controls.addWidget(self.lbl_timeline_caption, 0)
+        lbl_start = QLabel("Start")
+        lbl_start.setStyleSheet("color: #667085;")
+        controls.addWidget(lbl_start, 0)
         self.slider_view = QSlider(Qt.Horizontal, self)
         self.slider_view.valueChanged.connect(self._on_view_start_changed)
         controls.addWidget(self.slider_view, 2)
-        controls.addSpacing(8)
-        controls.addWidget(QLabel("View span:"))
+        lbl_span = QLabel("Span")
+        lbl_span.setStyleSheet("color: #667085;")
+        controls.addWidget(lbl_span, 0)
         self.slider_span = QSlider(Qt.Horizontal, self)
         self.slider_span.valueChanged.connect(self._on_view_span_changed)
         controls.addWidget(self.slider_span, 3)
+        controls.addSpacing(6)
+        self.lbl_view_summary = QLabel("Frames --")
+        self.lbl_view_summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_view_summary.setStyleSheet("color: #667085; font-weight: 600;")
+        controls.addWidget(self.lbl_view_summary, 0)
         layout.addLayout(controls)
 
         self._init_sliders()
@@ -488,17 +523,22 @@ class HOITimeline(QWidget):
         return self._gutter_px
 
     def _compute_gutter_px(self, titles: List[str]):
-        fm = QFontMetrics(QFont("Arial", 9))
+        font = QFont(self.font())
+        if font.pointSizeF() <= 0:
+            font.setPointSizeF(9.0)
+        fm = QFontMetrics(font)
         max_w = 0
         for t in titles:
-            if not t:
-                continue
-            try:
-                w = fm.horizontalAdvance(t)
-            except AttributeError:
-                w = fm.width(t)
-            max_w = max(max_w, w)
-        self._gutter_px = max(90, max_w + 16)
+            for part in str(t or "").splitlines():
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    w = fm.horizontalAdvance(part)
+                except AttributeError:
+                    w = fm.width(part)
+                max_w = max(max_w, w)
+        self._gutter_px = max(112, min(180, max_w + 20))
 
     def update_titles(self):
         titles = []
@@ -526,6 +566,16 @@ class HOITimeline(QWidget):
         self._init_sliders()
         self.refresh()
 
+    def _update_view_summary(self):
+        if not hasattr(self, "lbl_view_summary"):
+            return
+        fc = max(1, int(self._get_fc()))
+        fps = max(1, int(self._get_fps()))
+        span = max(1, int(self._view_span or fc))
+        start = max(0, int(self._view_start))
+        end = max(start, min(fc - 1, start + span - 1))
+        self.lbl_view_summary.setText(f"F {start}-{end} | {span / fps:.1f}s")
+
     def _init_sliders(self):
         fc = max(1, int(self._get_fc()))
         self._block_view_signal = True
@@ -547,6 +597,7 @@ class HOITimeline(QWidget):
         self.slider_span.blockSignals(False)
 
         self._refresh_view_slider()
+        self._update_view_summary()
         self._block_view_signal = False
 
     def _refresh_view_slider(self):
@@ -561,11 +612,13 @@ class HOITimeline(QWidget):
         self.slider_view.blockSignals(False)
         for row in self.actor_rows.values():
             row.update()
+        self._update_view_summary()
 
     def _on_view_start_changed(self, v: int):
         self._view_start = int(v)
         for row in self.actor_rows.values():
             row.update()
+        self._update_view_summary()
 
     def _on_view_span_changed(self, val: int):
         fc = max(1, int(self._get_fc()))
@@ -580,6 +633,7 @@ class HOITimeline(QWidget):
         if not self._block_view_signal:
             self._user_span_override = True
         self._refresh_view_slider()
+        self._update_view_summary()
 
     def _ensure_visible(self, frame: int):
         fc = max(1, int(self._get_fc()))

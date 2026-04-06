@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt, QSize, QRect
+from PyQt5.QtCore import Qt, QSize, QRect, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QBrush
 from PyQt5.QtWidgets import QAbstractButton, QListWidget, QStyleOptionViewItem, QStyle
 
@@ -48,6 +48,8 @@ class ToggleSwitch(QAbstractButton):
 class ClickToggleList(QListWidget):
     """A checklist that toggles by clicking the item body, not only the checkbox."""
 
+    bodyDoubleClicked = pyqtSignal(object)
+
     def mousePressEvent(self, event):
         item = self.itemAt(event.pos())
         if item is None:
@@ -63,3 +65,19 @@ class ClickToggleList(QListWidget):
         item.setCheckState(
             Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
         )
+
+    def mouseDoubleClickEvent(self, event):
+        item = self.itemAt(event.pos())
+        if item is None:
+            return super().mouseDoubleClickEvent(event)
+        option = QStyleOptionViewItem()
+        option.initFrom(self)
+        option.rect = self.visualItemRect(item)
+        indicator = self.style().subElementRect(
+            QStyle.SE_ItemViewItemCheckIndicator, option, self
+        )
+        if indicator.contains(event.pos()):
+            return super().mouseDoubleClickEvent(event)
+        self.setCurrentItem(item)
+        self.bodyDoubleClicked.emit(item)
+        event.accept()

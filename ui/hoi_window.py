@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -34,6 +34,8 @@ from PyQt5.QtWidgets import (
     QButtonGroup,
     QProgressDialog,
     QApplication,
+    QTabWidget,
+    QScrollArea,
 )
 from ui.mixins import FrameControlMixin
 from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer
@@ -45,12 +47,29 @@ import hashlib
 from ui.video_player import VideoPlayer
 from ui.label_panel import LabelPanel
 from core.models import LabelDef
+from core.hoi_query_controller import (
+    apply_field_suggestion,
+    build_query_candidates,
+    clear_field_suggestion,
+    clear_field_value,
+    ensure_hand_annotation_state,
+    get_field_state,
+    hydrate_existing_field_state,
+    set_field_confirmation,
+    set_field_suggestion,
+    _safe_int,
+    _UNSET,
+)
+from core.structured_event_graph import build_hoi_event_graph, save_event_graph_sidecar
 from utils.constants import PRESET_COLORS, color_from_key
 from utils.shortcut_settings import (
     load_shortcut_bindings,
     default_shortcut_bindings,
     shortcut_value,
     set_shortcut_key,
+    load_ui_preferences,
+    save_ui_preferences,
+    save_logging_policy,
 )
 from utils.op_logger import OperationLogger
 from ui.hoi_timeline import HOITimeline
@@ -59,8 +78,66 @@ import os
 import cv2
 import re
 import yaml
+import time
 from datetime import datetime
 from core.videomae_v2_logic import VideoMAEHandler
+
+
+
+class EditableTitleGroupBox(QGroupBox):
+    """Group box whose title can be renamed by double-clicking the title band."""
+
+    titleEdited = pyqtSignal(str)
+
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        self._title_editor = QLineEdit(self)
+        self._title_editor.hide()
+        self._title_editor.editingFinished.connect(self._finish_title_edit)
+        self.setToolTip("Double-click the title to rename it.")
+
+    def _title_edit_geometry(self):
+        fm = self.fontMetrics()
+        left = 12
+        top = 2
+        height = max(24, fm.height() + 10)
+        width = max(
+            180,
+            min(self.width() - 24, fm.horizontalAdvance(self.title() or "Title") + 36),
+        )
+        return left, top, width, height
+
+    def _begin_title_edit(self):
+        left, top, width, height = self._title_edit_geometry()
+        self._title_editor.setGeometry(left, top, width, height)
+        self._title_editor.setText(self.title())
+        self._title_editor.show()
+        self._title_editor.raise_()
+        self._title_editor.setFocus()
+        self._title_editor.selectAll()
+
+    def _finish_title_edit(self):
+        if not self._title_editor.isVisible():
+            return
+        new_title = self._title_editor.text().strip() or self.title()
+        self._title_editor.hide()
+        if new_title != self.title():
+            self.setTitle(new_title)
+            self.titleEdited.emit(new_title)
+
+    def mouseDoubleClickEvent(self, event):
+        left, top, width, height = self._title_edit_geometry()
+        if left <= event.pos().x() <= left + width and top <= event.pos().y() <= top + height:
+            self._begin_title_edit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._title_editor.isVisible():
+            left, top, width, height = self._title_edit_geometry()
+            self._title_editor.setGeometry(left, top, width, height)
 
 
 class ActionLabelSelector(QDialog):
@@ -247,10 +324,12 @@ class HOIWindow(FrameControlMixin, QWidget):
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setWindowTitle("HandOI / HOI Detection")
-        self.resize(1100, 720)
+        self.resize(1280, 840)
         self._on_close = on_close
         self._on_switch_task = on_switch_task
         self.op_logger = logger or OperationLogger(False)
+        self._ui_preferences = load_ui_preferences(default_ui_scale=0.85)
+        self._ui_scale = float(self._ui_preferences.get("ui_scale", 0.85) or 0.85)
         self._shortcut_bindings = load_shortcut_bindings()
         self._shortcut_defaults = default_shortcut_bindings()
 
@@ -269,6 +348,8 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.box_id_counter = 1
         self.verbs: List[LabelDef] = []
         self.current_verb_idx = -1
+        self._action_panel_sync = False
+        self._pending_field_sources: Dict[str, str] = {}
         self.events: List[dict] = []  # Store all events (internal event structure)
         self.event_id_counter = 0  # Event ID counter
         self._reset_event_draft()  # Initialize event draft structure
@@ -299,6 +380,17 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.videomae_handler = VideoMAEHandler()
         self.videomae_weights_path = ""
         self.videomae_verb_list_path = ""
+        self._videomae_loaded_key = ""
+        self._videomae_action_cache: Dict[str, List[dict]] = {}
+        self._videomae_event_signatures: Dict[int, str] = {}
+        self._videomae_auto_event_id: Optional[int] = None
+        self._videomae_auto_force_refresh = False
+        self._videomae_auto_timer = QTimer(self)
+        self._videomae_auto_timer.setSingleShot(True)
+        self._videomae_auto_timer.setInterval(400)
+        self._videomae_auto_timer.timeout.connect(
+            self._run_pending_action_label_refresh
+        )
         self._hoi_undo_stack = []
         self._hoi_redo_stack = []
         self._undo_block = False
@@ -313,13 +405,28 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.validation_op_logger = OperationLogger(self.op_logger.enabled)
         self._validation_highlights = {}
         self._hoi_saved_signature = None
+        self._experiment_mode = "full_assist"
+        self._next_best_query: Optional[Dict[str, Any]] = None
+        self._next_best_query_id = ""
+        self._next_best_query_presented_at = 0.0
 
-        # controls (reuse toolbar look/logic)
-        controls = QHBoxLayout()
-        # task switch for consistency / return
-        lbl_task = QLabel("Task:")
+        # controls (professional top chrome)
+        self.toolbar_frame = QFrame(self)
+        self.toolbar_frame.setObjectName("toolbarFrame")
+        toolbar_layout = QVBoxLayout(self.toolbar_frame)
+        toolbar_layout.setContentsMargins(8, 6, 8, 6)
+        toolbar_layout.setSpacing(4)
+
+        session_row = QHBoxLayout()
+        session_row.setContentsMargins(0, 0, 0, 0)
+        session_row.setSpacing(6)
+        transport_row = QHBoxLayout()
+        transport_row.setContentsMargins(0, 0, 0, 0)
+        transport_row.setSpacing(6)
+
+        lbl_task = QLabel("Task")
         lbl_task.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        controls.addWidget(lbl_task)
+        session_row.addWidget(lbl_task)
         self.combo_task = QComboBox()
         items = tasks or ["Action Segmentation", "HandOI / HOI Detection"]
         self.combo_task.addItems(items)
@@ -327,46 +434,109 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.combo_task.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.combo_task.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.combo_task.currentTextChanged.connect(self._on_task_combo_changed)
-        controls.addWidget(self.combo_task)
-        controls.addSpacing(8)
+        session_row.addWidget(self.combo_task)
+        if len(items) <= 1:
+            lbl_task.hide()
+            self.combo_task.hide()
 
-        # consolidated file menu
+        lbl_experiment_mode = QLabel("Mode")
+        lbl_experiment_mode.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        session_row.addWidget(lbl_experiment_mode)
+        self.combo_experiment_mode = QComboBox()
+        self.combo_experiment_mode.addItem("Manual", "manual")
+        self.combo_experiment_mode.addItem("Assist", "assist")
+        self.combo_experiment_mode.addItem("Full Assist", "full_assist")
+        self.combo_experiment_mode.setCurrentIndex(2)
+        self.combo_experiment_mode.setMinimumWidth(120)
+        self.combo_experiment_mode.setToolTip(
+            "Manual: no imported/detected assist. Assist: detection and box assist only. Full Assist: detection plus VideoMAE action-label ranking."
+        )
+        self.combo_experiment_mode.currentIndexChanged.connect(
+            self._on_experiment_mode_changed
+        )
+        session_row.addWidget(self.combo_experiment_mode)
+        session_row.addStretch(1)
+
+        self.lbl_validation = QLabel("Validate")
+        self.lbl_validation.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        session_row.addWidget(self.lbl_validation)
+        self.btn_validation = ToggleSwitch(self)
+        self.btn_validation.setToolTip("Toggle validation on/off")
+        self.btn_validation.toggled.connect(self._on_validation_toggled)
+        session_row.addWidget(self.btn_validation)
+
         self.file_menu = QMenu(self)
         self.file_menu.addAction("Load Video...", self._load_video)
         self.file_menu.addSeparator()
-        self.file_menu.addAction("Import Instrument List...", self._import_instruments)
-        self.file_menu.addAction("Import Target List...", self._import_targets)
-        self.file_menu.addSeparator()
-        self.file_menu.addAction("Load Class Map (data.yaml)...", self._load_yaml)
-        self.file_menu.addAction("Import YOLO Boxes...", self._load_bboxes)
-        self.file_menu.addSeparator()
-        self.file_menu.addAction("Load YOLO Model...", self._load_yolo_model)
-        self.file_menu.addAction(
+        import_menu = self.file_menu.addMenu("Import")
+        import_menu.addAction("Instrument List...", self._import_instruments)
+        import_menu.addAction("Target List...", self._import_targets)
+        import_menu.addAction("Verb List...", self._load_verbs_txt)
+        import_menu.addSeparator()
+        import_menu.addAction("Class Map (data.yaml)...", self._load_yaml)
+        self.act_import_yolo_boxes = import_menu.addAction(
+            "YOLO Boxes...", self._load_bboxes
+        )
+        self.act_load_hands_xml = import_menu.addAction(
+            "Hands XML...", self._load_hands_xml
+        )
+        import_menu.addSeparator()
+        import_menu.addAction("HOI Annotations...", self._load_annotations_json)
+
+        detect_menu = self.file_menu.addMenu("Detection")
+        self.act_load_yolo_model = detect_menu.addAction(
+            "Load YOLO Model...", self._load_yolo_model
+        )
+        self.act_detect_current_frame = detect_menu.addAction(
             "Detect Current Frame", self._detect_current_frame_combined
         )
-        self.file_menu.addAction(
+        self.act_detect_selected_action = detect_menu.addAction(
             "Detect Selected Action", self._detect_selected_action
         )
-        self.file_menu.addAction("Detect All Actions", self._detect_all_actions)
-        self.file_menu.addAction("Load Hands XML...", self._load_hands_xml)
-        self.file_menu.addAction("Import Verb List...", self._load_verbs_txt)
-        self.file_menu.addAction(
-            "Load HOI Annotations...", self._load_annotations_json
+        self.act_detect_all_actions = detect_menu.addAction(
+            "Detect All Actions", self._detect_all_actions
         )
+        self.act_swap_hands = detect_menu.addAction("Auto Swap Left / Right")
+        self.act_swap_hands.setCheckable(True)
+        self.act_swap_hands.toggled.connect(
+            lambda on: setattr(self, "mp_hands_swap", on)
+        )
+        detect_menu.addSeparator()
+        self.act_incremental_train_yolo = detect_menu.addAction(
+            "YOLO Incremental Training...", self._incremental_train_yolo
+        )
+
+        assist_menu = self.file_menu.addMenu("Action Assist")
+        self.act_load_videomae_model = assist_menu.addAction(
+            "Load VideoMAE Model...", self._load_videomae_model
+        )
+        self.act_load_videomae_verb_list = assist_menu.addAction(
+            "Load VideoMAE Verb List...", self._load_videomae_verb_list
+        )
+        assist_menu.addSeparator()
+        self.act_review_selected_action_label = assist_menu.addAction(
+            "Review Selected Action Label...", self._detect_selected_action_label
+        )
+        self.act_auto_apply_action_labels = assist_menu.addAction(
+            "Auto-Apply Action Labels to All Events", self._detect_all_action_labels
+        )
+
+        save_menu = self.file_menu.addMenu("Save / Export")
+        save_menu.addAction("Save HOI Annotations...", self._save_annotations_json)
+        save_menu.addAction("Export Hands XML...", self._save_hands_xml)
         self.file_menu.addSeparator()
-        self.file_menu.addAction("Save HOI Annotations...", self._save_annotations_json)
-        self.file_menu.addAction("Export Hands XML...", self._save_hands_xml)
-        self.file_menu.addSeparator()
-        self.file_menu.addAction("YOLO Incremental Training...", self._incremental_train_yolo)
-        self.file_menu.addSeparator()
-        self.file_menu.addAction("Load VideoMAE Model...", self._load_videomae_model)
-        self.file_menu.addAction("Load VideoMAE Verb List...", self._load_videomae_verb_list)
-        self.file_menu.addAction("Detect Selected Action Label", self._detect_selected_action_label)
-        self.file_menu.addAction("Detect All Action Labels", self._detect_all_action_labels)
+        self.file_menu.addAction("Settings...", self._open_settings_dialog)
+
         self.btn_file_menu = QToolButton()
-        self.btn_file_menu.setText("Files")
+        self.btn_file_menu.setText("\u22EF")
+        self.btn_file_menu.setToolTip(
+            "Project, import/export, detection, and model actions"
+        )
         self.btn_file_menu.setPopupMode(QToolButton.InstantPopup)
         self.btn_file_menu.setMenu(self.file_menu)
+        self.btn_file_menu.setFixedWidth(30)
+        session_row.addWidget(self.btn_file_menu)
+
         self.btn_rew = QToolButton()
         self.btn_rew.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekBackward))
         self.btn_play = QToolButton()
@@ -383,12 +553,14 @@ class HOIWindow(FrameControlMixin, QWidget):
             self.btn_ff,
         ):
             b.setToolButtonStyle(Qt.ToolButtonIconOnly)
-            b.setIconSize(QSize(22, 22))
+            b.setIconSize(QSize(20, 20))
         self.spin_jump = QSpinBox()
         self.spin_jump.setMinimum(0)
         self.spin_jump.setMaximum(0)
         self.spin_jump.setKeyboardTracking(False)
-        self.btn_jump = QPushButton("Go")
+        self.btn_jump = QToolButton()
+        self.btn_jump.setText("\u2192")
+        self.btn_jump.setToolTip("Jump to frame")
 
         self.btn_rew.clicked.connect(lambda: self._seek_relative(-10))
         self.btn_ff.clicked.connect(lambda: self._seek_relative(+10))
@@ -397,79 +569,57 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.btn_jump.clicked.connect(self._jump_to_spin)
 
         self.combo_verb = QComboBox()
-        self.combo_verb.setMinimumWidth(120)
+        self.combo_verb.setMinimumWidth(96)
         self.combo_verb.setEditable(True)
-        # order mirrors the Action Segmentation toolbar for consistency
-        controls.addWidget(self.btn_rew)
-        controls.addWidget(self.btn_play)
-        controls.addWidget(self.btn_stop)
-        controls.addWidget(self.btn_ff)
-        controls.addSpacing(12)
-        label_width = 48
-        lbl_jump = QLabel("Jump")
-        lbl_jump.setFixedWidth(label_width)
-        lbl_jump.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        controls.addWidget(lbl_jump)
-        controls.addWidget(self.spin_jump)
-        controls.addWidget(self.btn_jump)
-        controls.addSpacing(12)
-        # compact start/end controls inline
-        lbl_start = QLabel("Start")
-        lbl_start.setFixedWidth(label_width)
-        lbl_start.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        controls.addWidget(lbl_start)
-        self.spin_start_offset = QSpinBox()
-        self.spin_start_offset.setMinimum(0)
-        self.spin_start_offset.valueChanged.connect(self._on_offset_changed)
-        controls.addWidget(self.spin_start_offset)
-        lbl_end = QLabel("End")
-        lbl_end.setFixedWidth(label_width)
-        lbl_end.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        controls.addWidget(lbl_end)
-        self.spin_end_frame = QSpinBox()
-        self.spin_end_frame.setMinimum(0)
-        self.spin_end_frame.setMaximum(10**9)
-        self.spin_end_frame.valueChanged.connect(self._on_offset_changed)
-        controls.addWidget(self.spin_end_frame)
-        controls.addSpacing(12)
-        controls.addWidget(self.btn_file_menu)
-        self.btn_detect = QToolButton()
-        self.btn_detect.setText("Detect Frame")
-        self.btn_detect.setToolButtonStyle(Qt.ToolButtonTextOnly)
+
+        self.btn_detect = QToolButton(self)
+        self.btn_detect.setText("Frame")
         self.btn_detect.setToolTip(
             "Detect objects + hands on current frame (Ctrl+Shift+D)"
         )
         self.btn_detect.clicked.connect(self._detect_current_frame_combined)
-        controls.addWidget(self.btn_detect)
-        self.btn_detect_action = QToolButton()
-        self.btn_detect_action.setText("Detect Action")
+        self.btn_detect_action = QToolButton(self)
+        self.btn_detect_action.setText("Action")
         self.btn_detect_action.setToolTip(
             "Detect assigned objects on the selected action's start, onset, and end frames."
         )
         self.btn_detect_action.clicked.connect(self._detect_selected_action)
-        controls.addWidget(self.btn_detect_action)
-        self.btn_detect_all = QToolButton()
-        self.btn_detect_all.setText("Detect All")
-        self.btn_detect_all.setToolTip(
-            "Detect assigned objects across every action keyframe."
-        )
-        self.btn_detect_all.clicked.connect(self._detect_all_actions)
-        controls.addWidget(self.btn_detect_all)
-        self.chk_swap_hands = QCheckBox("Auto swap L/R")
-        self.chk_swap_hands.setToolTip(
-            "Swap Left/Right labels for MediaPipe detections (mirrored video). Affects new detections only."
-        )
-        self.chk_swap_hands.toggled.connect(
-            lambda on: setattr(self, "mp_hands_swap", on)
-        )
-        controls.addWidget(self.chk_swap_hands)
-        self.chk_edit_boxes = QCheckBox("Edit boxes")
+
+        transport_row.addWidget(self.btn_rew)
+        transport_row.addWidget(self.btn_play)
+        transport_row.addWidget(self.btn_stop)
+        transport_row.addWidget(self.btn_ff)
+        transport_row.addSpacing(8)
+        transport_row.addWidget(QLabel("Jump"))
+        transport_row.addWidget(self.spin_jump)
+        transport_row.addWidget(self.btn_jump)
+        transport_row.addSpacing(8)
+        transport_row.addWidget(QLabel("Start"))
+        self.spin_start_offset = QSpinBox()
+        self.spin_start_offset.setMinimum(0)
+        self.spin_start_offset.valueChanged.connect(self._on_offset_changed)
+        transport_row.addWidget(self.spin_start_offset)
+        transport_row.addWidget(QLabel("End"))
+        self.spin_end_frame = QSpinBox()
+        self.spin_end_frame.setMinimum(0)
+        self.spin_end_frame.setMaximum(10**9)
+        self.spin_end_frame.valueChanged.connect(self._on_offset_changed)
+        transport_row.addWidget(self.spin_end_frame)
+        transport_row.addStretch(1)
+
+        self.chk_edit_boxes = QCheckBox("\u270E Boxes")
+        self.chk_edit_boxes.setToolTip("Enable direct box editing on the video canvas.")
         self.chk_edit_boxes.toggled.connect(self._on_edit_boxes_toggled)
-        controls.addWidget(self.chk_edit_boxes)
-        controls.addSpacing(6)
-        controls.addWidget(QLabel("Auto label"))
+
+        self.draw_mode_widget = QWidget(self)
+        draw_mode_row = QHBoxLayout(self.draw_mode_widget)
+        draw_mode_row.setContentsMargins(0, 0, 0, 0)
+        draw_mode_row.setSpacing(6)
+        lbl_draw_mode = QLabel("Draw")
+        lbl_draw_mode.setObjectName("captionLabel")
+        draw_mode_row.addWidget(lbl_draw_mode)
         self.rad_draw_none = QRadioButton("Manual")
-        self.rad_draw_inst = QRadioButton("Instrument")
+        self.rad_draw_inst = QRadioButton("Inst")
         self.rad_draw_target = QRadioButton("Target")
         self.rad_draw_none.setChecked(True)
         self.rad_draw_none.setToolTip("Draw boxes and enter labels manually.")
@@ -479,60 +629,43 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.rad_draw_target.setToolTip(
             "New boxes inherit the selected hand's target label."
         )
-        controls.addWidget(self.rad_draw_none)
-        controls.addWidget(self.rad_draw_inst)
-        controls.addWidget(self.rad_draw_target)
+        draw_mode_row.addWidget(self.rad_draw_none)
+        draw_mode_row.addWidget(self.rad_draw_inst)
+        draw_mode_row.addWidget(self.rad_draw_target)
         for widget in (self.rad_draw_none, self.rad_draw_inst, self.rad_draw_target):
             widget.setEnabled(False)
-        controls.addSpacing(8)
-        self.sep_edit_validation = QFrame()
-        self.sep_edit_validation.setFrameShape(QFrame.VLine)
-        self.sep_edit_validation.setFrameShadow(QFrame.Sunken)
-        self.sep_edit_validation.setLineWidth(1)
-        self.sep_edit_validation.setFixedHeight(18)
-        controls.addWidget(self.sep_edit_validation)
-        controls.addSpacing(8)
-        self.lbl_validation = QLabel("Validation")
-        self.lbl_validation.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        controls.addWidget(self.lbl_validation)
-        self.btn_validation = ToggleSwitch(self)
-        self.btn_validation.setToolTip("Toggle validation on/off")
-        self.btn_validation.toggled.connect(self._on_validation_toggled)
-        controls.addWidget(self.btn_validation)
-        controls.addStretch(1)
+        self.draw_mode_widget.hide()
 
-        # video row (match main layout: video on left, panels on right), controls below
+        toolbar_layout.addLayout(session_row)
+        toolbar_layout.addLayout(transport_row)
+
+        # video row (main canvas above, inspector below)
         video_row = QHBoxLayout()
         video_row.setContentsMargins(0, 0, 0, 0)
         video_row.setSpacing(8)
-        video_row.addWidget(self.player, 3)
+        video_row.addWidget(self.player, 1)
 
-        right_col = QVBoxLayout()
         self.list_objects = QListWidget()
         self.list_objects.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list_objects.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_objects.customContextMenuRequested.connect(self._on_object_list_menu)
-        self.list_objects.show()
         self.list_objects.itemSelectionChanged.connect(self._on_object_selection)
         self.list_objects.setEnabled(False)
-        
-        self.list_top5 = QListWidget()
-        self.list_top5.setSelectionMode(QAbstractItemView.NoSelection)
-        self.list_top5.show()
-        self.list_top5.setEnabled(False)
-        
-        right_col.addWidget(QLabel("Objects (current frame):"))
-        right_col.addWidget(self.list_objects, 1)
-        right_col.addWidget(QLabel("Action Top 5 (VideoMAE):"))
-        right_col.addWidget(self.list_top5, 1)
+        self.list_objects.setAlternatingRowColors(True)
+        self.list_objects.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
 
         # --- Customizable Extra Label Module UI setup moved to top of __init__ ---
-        self.group_anomaly = QGroupBox(self.extra_label_config.get("title", "Hand Anomaly Label"))
+        self.group_anomaly = EditableTitleGroupBox(
+            self.extra_label_config.get("title", "Hand Anomaly Label")
+        )
+        self.group_anomaly.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.group_anomaly.titleEdited.connect(self._on_anomaly_title_edited)
         self.anomaly_labels = list(self.extra_label_config.get("labels", []))
         self.anomaly_rules = {}
         self._init_anomaly_rules()
         self.anomaly_list = ClickToggleList()
         self.anomaly_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.anomaly_list.setEditTriggers(QAbstractItemView.EditKeyPressed)
         self.anomaly_list.setFlow(QListView.LeftToRight)
         self.anomaly_list.setWrapping(True)
         self.anomaly_list.setResizeMode(QListView.Adjust)
@@ -542,8 +675,10 @@ class HOIWindow(FrameControlMixin, QWidget):
             "QListWidget::indicator { width: 14px; height: 14px; }"
         )
         self.anomaly_list.itemChanged.connect(self._on_anomaly_item_changed)
+        self.anomaly_list.bodyDoubleClicked.connect(self._on_anomaly_item_double_clicked)
+        self.anomaly_list.setToolTip("Double-click a label to rename it.")
         self.anomaly_list.setWordWrap(True)
-        self.anomaly_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.anomaly_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         self._anomaly_block = False
         for name in self.anomaly_labels:
             self._add_anomaly_item(name, checked=(name.strip().lower() == self.extra_label_config.get("default_label", "Normal").strip().lower()))
@@ -553,13 +688,9 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.btn_anomaly_add = QPushButton("Add")
         self.btn_anomaly_remove = QPushButton("Remove")
         self.btn_anomaly_rules = QPushButton("Rules")
-        self.btn_anomaly_rename = QPushButton("Rename")
-        self.btn_anomaly_rename_item = QPushButton("Rename Label")
         self.btn_anomaly_add.clicked.connect(self._add_anomaly_label)
-        self.btn_anomaly_rename_item.clicked.connect(self._rename_anomaly_label)
         self.btn_anomaly_remove.clicked.connect(self._remove_anomaly_label)
         self.btn_anomaly_rules.clicked.connect(self._edit_anomaly_rules)
-        self.btn_anomaly_rename.clicked.connect(self._rename_anomaly_module)
 
         anomaly_layout = QVBoxLayout()
         anomaly_layout.addWidget(self.anomaly_list)
@@ -568,38 +699,36 @@ class HOIWindow(FrameControlMixin, QWidget):
         row.addWidget(self.btn_anomaly_add)
         row.addWidget(self.btn_anomaly_remove)
         row.addWidget(self.btn_anomaly_rules)
-        row.addWidget(self.btn_anomaly_rename)
-        row.addWidget(self.btn_anomaly_rename_item)
         anomaly_layout.addLayout(row)
         self.group_anomaly.setLayout(anomaly_layout)
 
         hand_row = QHBoxLayout()
-        hand_row.addWidget(QLabel("Actors:"))
-        
+        hand_row.setContentsMargins(0, 0, 0, 0)
+        hand_row.setSpacing(8)
+        lbl_actors = QLabel("Actors")
+        lbl_actors.setObjectName("captionLabel")
+        hand_row.addWidget(lbl_actors)
+
         self.actor_layout = QHBoxLayout()
         hand_row.addLayout(self.actor_layout)
-        
+
         self.actor_controls = {}
         self._rebuild_actor_checkboxes()
 
-        self.btn_config_actors = QPushButton("Config")
+        self.btn_config_actors = QPushButton("Manage")
         self.btn_config_actors.setToolTip("Configure actors (Add/Remove/Rename)")
         self.btn_config_actors.clicked.connect(self._on_configure_actors)
         hand_row.addWidget(self.btn_config_actors)
 
-        self.btn_swap_draft = QPushButton("Swap")
+        self.btn_swap_draft = QPushButton("\u21C4")
         self.btn_swap_draft.setToolTip(
             "Swap actor boxes on the current frame (first two actors)."
         )
         self.btn_swap_draft.setStyleSheet("color: #111;")
         self.btn_swap_draft.clicked.connect(self._swap_frame_hands)
-
-        hand_row.addSpacing(10)
         hand_row.addWidget(self.btn_swap_draft)
-
         hand_row.addStretch(1)
 
-        # Initialize Verbs panel
         self.label_panel = LabelPanel(
             self.verbs,
             on_add=self._on_verb_added,
@@ -610,19 +739,52 @@ class HOIWindow(FrameControlMixin, QWidget):
             manage_storage=False,
         )
 
-        # Modify placeholder text: Label -> Verb
         for le in self.label_panel.findChildren(QLineEdit):
             ph = le.placeholderText().lower()
             if "search" in ph:
-                le.setPlaceholderText("Search verb")
+                le.setPlaceholderText("Search action library")
             elif "new" in ph:
-                le.setPlaceholderText("New verb name")
+                le.setPlaceholderText("Add action to library")
         self._init_verb_color_combo()
         self.label_panel.set_verb_only(True)
+        self.label_panel.set_admin_visible(False)
+        self.label_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
 
-        self.group_library = QGroupBox("Entity Library")
-        lib_layout = QFormLayout()
+        self.group_library = QGroupBox("Objects")
+        self.group_library.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        lib_layout = QVBoxLayout()
+        lib_layout.setContentsMargins(8, 8, 8, 8)
+        lib_layout.setSpacing(6)
 
+        object_tools_row = QHBoxLayout()
+        object_tools_row.setContentsMargins(0, 0, 0, 0)
+        object_tools_row.setSpacing(6)
+        object_tools_row.addWidget(self.btn_detect)
+        object_tools_row.addWidget(self.btn_detect_action)
+        self.btn_object_tools = QToolButton()
+        self.btn_object_tools.setText("⋯")
+        self.btn_object_tools.setPopupMode(QToolButton.InstantPopup)
+        self.btn_object_tools.setToolTip("More object tools")
+        self.object_tools_menu = QMenu(self.btn_object_tools)
+        self.object_tools_menu.addAction("Detect All", self._detect_all_actions)
+        self.object_tools_menu.addSeparator()
+        self.object_tools_menu.addAction(self.act_load_yolo_model)
+        self.object_tools_menu.addAction(self.act_incremental_train_yolo)
+        self.object_tools_menu.addSeparator()
+        self.object_tools_menu.addAction(self.act_swap_hands)
+        self.btn_object_tools.setMenu(self.object_tools_menu)
+        object_tools_row.addWidget(self.btn_object_tools)
+        object_tools_row.addStretch(1)
+        lib_layout.addLayout(object_tools_row)
+        edit_tools_row = QHBoxLayout()
+        edit_tools_row.setContentsMargins(0, 0, 0, 0)
+        edit_tools_row.setSpacing(6)
+        edit_tools_row.addWidget(self.chk_edit_boxes)
+        edit_tools_row.addStretch(1)
+        lib_layout.addLayout(edit_tools_row)
+        lib_layout.addWidget(self.draw_mode_widget)
+
+        link_form = QFormLayout()
         self.combo_instrument = QComboBox()
         self.combo_target = QComboBox()
         self.combo_instrument.addItem("None", None)
@@ -633,24 +795,245 @@ class HOIWindow(FrameControlMixin, QWidget):
         )
         self._enable_combo_search(self.combo_target, placeholder="Search target...")
 
-        lib_layout.addRow("Instrument:", self.combo_instrument)
-        lib_layout.addRow("Target:", self.combo_target)
+        link_form.addRow("Instrument", self.combo_instrument)
+        link_form.addRow("Target", self.combo_target)
+        lib_layout.addLayout(link_form)
 
+        lbl_current_objects = QLabel("Current Frame")
+        lbl_current_objects.setObjectName("captionLabel")
+        lib_layout.addWidget(lbl_current_objects)
+        lib_layout.addWidget(self.list_objects, 1)
         self.group_library.setLayout(lib_layout)
 
-        right_panel = QWidget()
-        right_panel.setLayout(right_col)
-        right_panel.setMaximumWidth(450)
-        video_row.addWidget(right_panel, 1)
+        hand_widget = QWidget()
+        hand_layout = QHBoxLayout(hand_widget)
+        hand_layout.setContentsMargins(0, 0, 0, 0)
+        hand_layout.addLayout(hand_row)
+
+        self.group_action = QGroupBox("Action")
+        self.group_action.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        action_layout = QVBoxLayout(self.group_action)
+        action_layout.setContentsMargins(8, 8, 8, 8)
+        action_layout.setSpacing(6)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.addWidget(QLabel("Final"))
+        self.combo_verb.setPlaceholderText("Select or type action...")
+        action_row.addWidget(self.combo_verb, 1)
+        self.btn_suggest_action_label = QToolButton()
+        self.btn_suggest_action_label.setText("\u21BB")
+        self.btn_suggest_action_label.setToolTip(
+            "Force a fresh VideoMAE ranking for the selected HOI event. Ranking also updates automatically when you select or retime an event."
+        )
+        self.btn_suggest_action_label.clicked.connect(self._refresh_selected_action_label)
+        self.btn_action_tools = QToolButton()
+        self.btn_action_tools.setText("\u22EF")
+        self.btn_action_tools.setPopupMode(QToolButton.InstantPopup)
+        self.btn_action_tools.setToolTip("Action tools")
+        self.action_tools_menu = QMenu(self.btn_action_tools)
+        self.act_toggle_verb_library_admin = self.action_tools_menu.addAction(
+            "Manage Verb Library"
+        )
+        self.act_toggle_verb_library_admin.setCheckable(True)
+        self.act_toggle_verb_library_admin.toggled.connect(
+            self._set_verb_library_admin_mode
+        )
+        self.action_tools_menu.addSeparator()
+        self.act_batch_apply_action_labels = self.action_tools_menu.addAction(
+            "Auto-Apply Top-1 to All Events", self._detect_all_action_labels
+        )
+        self.btn_action_tools.setMenu(self.action_tools_menu)
+        action_row.addWidget(self.btn_suggest_action_label)
+        action_row.addWidget(self.btn_action_tools)
+        action_layout.addLayout(action_row)
+        action_layout.addWidget(self.label_panel, 1)
+
+        self.label_panel.verb_list.itemClicked.connect(self._on_verb_library_item_clicked)
+        self.label_panel.verb_list.setToolTip(
+            "Click a verb to apply it to the current action."
+        )
+
+        self.event_status_card = QFrame(self)
+        self.event_status_card.setObjectName("statusCard")
+        event_status_layout = QVBoxLayout(self.event_status_card)
+        event_status_layout.setContentsMargins(12, 12, 12, 12)
+        event_status_layout.setSpacing(8)
+        event_header = QHBoxLayout()
+        event_header.setContentsMargins(0, 0, 0, 0)
+        self.lbl_event_title = QLabel("No event selected")
+        self.lbl_event_title.setObjectName("statusTitle")
+        event_header.addWidget(self.lbl_event_title, 1)
+        self.lbl_event_actor_chip = QLabel("Idle")
+        self.lbl_event_actor_chip.setAlignment(Qt.AlignCenter)
+        event_header.addWidget(self.lbl_event_actor_chip)
+        self.lbl_event_health_chip = QLabel("Waiting")
+        self.lbl_event_health_chip.setAlignment(Qt.AlignCenter)
+        event_header.addWidget(self.lbl_event_health_chip)
+        event_status_layout.addLayout(event_header)
+        self.lbl_event_frames = QLabel("Frames: ?")
+        self.lbl_event_frames.setObjectName("statusSubtle")
+        event_status_layout.addWidget(self.lbl_event_frames)
+        self.lbl_event_meta = QLabel("Verb: ?   Instrument: ?   Target: ?")
+        self.lbl_event_meta.setWordWrap(True)
+        event_status_layout.addWidget(self.lbl_event_meta)
+        self.lbl_event_status = QLabel("No HandOI segment selected.")
+        self.lbl_event_status.setWordWrap(True)
+        self.lbl_event_status.setObjectName("statusSubtle")
+        event_status_layout.addWidget(self.lbl_event_status)
+        keyframe_row = QHBoxLayout()
+        keyframe_row.setContentsMargins(0, 0, 0, 0)
+        keyframe_row.setSpacing(6)
+        self.btn_jump_start_chip = QPushButton("Start")
+        self.btn_jump_start_chip.setProperty("compactChip", True)
+        self.btn_jump_start_chip.clicked.connect(self._jump_to_selected_start)
+        self.btn_jump_onset_chip = QPushButton("Onset")
+        self.btn_jump_onset_chip.setProperty("compactChip", True)
+        self.btn_jump_onset_chip.clicked.connect(self._jump_to_selected_onset)
+        self.btn_jump_end_chip = QPushButton("End")
+        self.btn_jump_end_chip.setProperty("compactChip", True)
+        self.btn_jump_end_chip.clicked.connect(self._jump_to_selected_end)
+        keyframe_row.addWidget(self.btn_jump_start_chip)
+        keyframe_row.addWidget(self.btn_jump_onset_chip)
+        keyframe_row.addWidget(self.btn_jump_end_chip)
+        keyframe_row.addStretch(1)
+        event_status_layout.addLayout(keyframe_row)
+
+        self.event_tab = QWidget()
+        event_layout = QVBoxLayout(self.event_tab)
+        event_layout.setContentsMargins(0, 0, 0, 0)
+        event_layout.setSpacing(8)
+        event_layout.addWidget(self.event_status_card)
+        event_layout.addWidget(hand_widget)
+        event_layout.addWidget(self.group_action)
+        event_layout.addStretch(1)
+
+        self.objects_tab = QWidget()
+        objects_layout = QVBoxLayout(self.objects_tab)
+        objects_layout.setContentsMargins(0, 0, 0, 0)
+        objects_layout.setSpacing(8)
+        objects_layout.addWidget(self.group_library)
+        objects_layout.addStretch(1)
+
+        self.review_status_card = QFrame(self)
+        self.review_status_card.setObjectName("statusCard")
+        review_status_layout = QVBoxLayout(self.review_status_card)
+        review_status_layout.setContentsMargins(12, 12, 12, 12)
+        review_status_layout.setSpacing(8)
+        review_header = QHBoxLayout()
+        review_header.setContentsMargins(0, 0, 0, 0)
+        self.lbl_review_title = QLabel("Review Summary")
+        self.lbl_review_title.setObjectName("statusTitle")
+        review_header.addWidget(self.lbl_review_title, 1)
+        self.lbl_validation_chip = QLabel("Validation Off")
+        self.lbl_validation_chip.setAlignment(Qt.AlignCenter)
+        review_header.addWidget(self.lbl_validation_chip)
+        self.lbl_incomplete_chip = QLabel("Incomplete n/a")
+        self.lbl_incomplete_chip.setAlignment(Qt.AlignCenter)
+        review_header.addWidget(self.lbl_incomplete_chip)
+        review_status_layout.addLayout(review_header)
+        self.lbl_review_status = QLabel("No review issues yet.")
+        self.lbl_review_status.setObjectName("statusSubtle")
+        self.lbl_review_status.setWordWrap(True)
+        review_status_layout.addWidget(self.lbl_review_status)
+        review_nav_row = QHBoxLayout()
+        review_nav_row.setContentsMargins(0, 0, 0, 0)
+        review_nav_row.setSpacing(6)
+        self.btn_review_prev = QPushButton("Prev")
+        self.btn_review_prev.clicked.connect(lambda: self._jump_incomplete(-1))
+        self.btn_review_next = QPushButton("Next")
+        self.btn_review_next.clicked.connect(lambda: self._jump_incomplete(+1))
+        review_nav_row.addWidget(self.btn_review_prev)
+        review_nav_row.addWidget(self.btn_review_next)
+        review_nav_row.addStretch(1)
+        review_status_layout.addLayout(review_nav_row)
+
+        self.next_query_card = QFrame(self)
+        self.next_query_card.setObjectName("statusCard")
+        next_query_layout = QVBoxLayout(self.next_query_card)
+        next_query_layout.setContentsMargins(12, 12, 12, 12)
+        next_query_layout.setSpacing(8)
+        next_query_header = QHBoxLayout()
+        next_query_header.setContentsMargins(0, 0, 0, 0)
+        self.lbl_next_query_title = QLabel("Next Best Query")
+        self.lbl_next_query_title.setObjectName("statusTitle")
+        next_query_header.addWidget(self.lbl_next_query_title, 1)
+        self.lbl_next_query_surface_chip = QLabel("Idle")
+        self.lbl_next_query_surface_chip.setAlignment(Qt.AlignCenter)
+        next_query_header.addWidget(self.lbl_next_query_surface_chip)
+        self.lbl_next_query_score_chip = QLabel("VOI --")
+        self.lbl_next_query_score_chip.setAlignment(Qt.AlignCenter)
+        next_query_header.addWidget(self.lbl_next_query_score_chip)
+        next_query_layout.addLayout(next_query_header)
+        self.lbl_next_query_summary = QLabel("No pending query yet.")
+        self.lbl_next_query_summary.setWordWrap(True)
+        next_query_layout.addWidget(self.lbl_next_query_summary)
+        self.lbl_next_query_reason = QLabel("The controller will surface the most valuable next supervision step here.")
+        self.lbl_next_query_reason.setObjectName("statusSubtle")
+        self.lbl_next_query_reason.setWordWrap(True)
+        next_query_layout.addWidget(self.lbl_next_query_reason)
+        next_query_metrics_row = QHBoxLayout()
+        next_query_metrics_row.setContentsMargins(0, 0, 0, 0)
+        next_query_metrics_row.setSpacing(6)
+        self.lbl_next_query_prop_chip = QLabel("Prop --")
+        self.lbl_next_query_prop_chip.setAlignment(Qt.AlignCenter)
+        next_query_metrics_row.addWidget(self.lbl_next_query_prop_chip)
+        self.lbl_next_query_cost_chip = QLabel("Cost --")
+        self.lbl_next_query_cost_chip.setAlignment(Qt.AlignCenter)
+        next_query_metrics_row.addWidget(self.lbl_next_query_cost_chip)
+        self.lbl_next_query_risk_chip = QLabel("Risk --")
+        self.lbl_next_query_risk_chip.setAlignment(Qt.AlignCenter)
+        next_query_metrics_row.addWidget(self.lbl_next_query_risk_chip)
+        next_query_metrics_row.addStretch(1)
+        next_query_layout.addLayout(next_query_metrics_row)
+        self.lbl_next_query_evidence = QLabel("Sparse evidence: --")
+        self.lbl_next_query_evidence.setObjectName("statusSubtle")
+        self.lbl_next_query_evidence.setWordWrap(True)
+        next_query_layout.addWidget(self.lbl_next_query_evidence)
+        next_query_action_row = QHBoxLayout()
+        next_query_action_row.setContentsMargins(0, 0, 0, 0)
+        next_query_action_row.setSpacing(6)
+        self.btn_next_query_focus = QPushButton("Focus")
+        self.btn_next_query_focus.clicked.connect(self._focus_next_best_query)
+        self.btn_next_query_apply = QPushButton("Apply")
+        self.btn_next_query_apply.clicked.connect(self._apply_next_best_query)
+        next_query_action_row.addWidget(self.btn_next_query_focus)
+        next_query_action_row.addWidget(self.btn_next_query_apply)
+        next_query_action_row.addStretch(1)
+        next_query_layout.addLayout(next_query_action_row)
+
+        self.review_tab = QWidget()
+        review_layout = QVBoxLayout(self.review_tab)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_layout.setSpacing(8)
+        review_layout.addWidget(self.review_status_card)
+        review_layout.addWidget(self.next_query_card)
+        review_layout.addWidget(self.group_anomaly)
+        review_layout.addStretch(1)
+
+        self.event_tab_scroll = self._make_inspector_scroll(self.event_tab)
+        self.objects_tab_scroll = self._make_inspector_scroll(self.objects_tab)
+        self.review_tab_scroll = self._make_inspector_scroll(self.review_tab)
+
+        self.inspector_tabs = QTabWidget(self)
+        self.inspector_tabs.setObjectName("inspectorTabs")
+        self.inspector_tabs.setDocumentMode(True)
+        self.inspector_tabs.addTab(self.event_tab_scroll, "Event")
+        self.inspector_tabs.addTab(self.objects_tab_scroll, "Objects")
+        self.inspector_tabs.addTab(self.review_tab_scroll, "Review")
+        self.inspector_tabs.setMinimumWidth(240)
+        self.inspector_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
         top_block = QWidget(self)
         top_layout = QVBoxLayout(top_block)
         top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(4)
+        top_layout.setSpacing(6)
         top_layout.addLayout(video_row, 1)
-        top_layout.addLayout(controls)
+        top_layout.addWidget(self.toolbar_frame)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self._on_slider_changed)
         top_layout.addWidget(self.slider)
@@ -696,75 +1079,27 @@ class HOIWindow(FrameControlMixin, QWidget):
         footer.addWidget(self.btn_incomplete_prev)
         footer.addWidget(self.btn_incomplete_next)
         timeline_layout.addLayout(footer)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
-
-        hand_widget = QWidget()
-        hand_layout = QHBoxLayout(hand_widget)
-        hand_layout.setContentsMargins(0, 0, 0, 0)
-        hand_layout.addLayout(hand_row)
-
-        verb_container = QWidget()
-        verb_layout = QVBoxLayout(verb_container)
-        verb_layout.setContentsMargins(0, 0, 0, 0)
-        verb_layout.setSpacing(2)
-
-        self.combo_verb.setPlaceholderText("Select or type verb...")
-        verb_layout.addWidget(self.combo_verb)
-
-        verb_layout.addWidget(self.label_panel)
-
-        internal_list = self.label_panel.findChild(QListWidget)
-        if internal_list:
-            try:
-                internal_list.itemDoubleClicked.disconnect()
-            except Exception:
-                pass
-            internal_list.itemDoubleClicked.connect(self._on_verb_double_clicked)
-
-        self.left_panel_split = QSplitter(Qt.Vertical, self)
-        self.left_panel_split.setChildrenCollapsible(False)
-        self.left_panel_split.setHandleWidth(6)
-
-        self.left_panel_split.addWidget(self.group_library)
-        self.left_panel_split.addWidget(hand_widget)
-        self.left_panel_split.addWidget(verb_container)
-
-        self.left_panel_split.setStretchFactor(0, 0)
-        self.left_panel_split.setStretchFactor(1, 0)
-        self.left_panel_split.setStretchFactor(2, 1)
-        self.left_panel_split.setSizes([140, 60, 420])
-
-        left_layout.addWidget(self.left_panel_split)
-        left_panel.setMinimumWidth(180)
+        timeline_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.hoi_bottom_split = QSplitter(Qt.Horizontal, self)
         self.hoi_bottom_split.setChildrenCollapsible(False)
-        self.hoi_bottom_split.setHandleWidth(6)
-        self.timeline_split = QSplitter(Qt.Vertical, self)
-        self.timeline_split.setChildrenCollapsible(False)
-        self.timeline_split.setHandleWidth(6)
-        self.timeline_split.addWidget(self.group_anomaly)
-        self.timeline_split.addWidget(timeline_container)
-        self.timeline_split.setStretchFactor(0, 2)
-        self.timeline_split.setStretchFactor(1, 3)
-        self.timeline_split.setSizes([260, 360])
-
-        self.hoi_bottom_split.addWidget(left_panel)
-        self.hoi_bottom_split.addWidget(self.timeline_split)
+        self.hoi_bottom_split.setHandleWidth(10)
+        self.hoi_bottom_split.setOpaqueResize(False)
+        self.hoi_bottom_split.addWidget(self.inspector_tabs)
+        self.hoi_bottom_split.addWidget(timeline_container)
         self.hoi_bottom_split.setStretchFactor(0, 0)
         self.hoi_bottom_split.setStretchFactor(1, 1)
-        self.hoi_bottom_split.setSizes([260, 940])
+        self.hoi_bottom_split.setSizes([280, 980])
+        self.hoi_bottom_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.root_split = QSplitter(Qt.Vertical, self)
         self.root_split.setChildrenCollapsible(False)
-        self.root_split.setHandleWidth(6)
+        self.root_split.setHandleWidth(10)
+        self.root_split.setOpaqueResize(False)
         self.root_split.addWidget(top_block)
         self.root_split.addWidget(self.hoi_bottom_split)
-        self.root_split.setStretchFactor(0, 2)
-        self.root_split.setStretchFactor(1, 3)
-        self.root_split.setSizes([540, 360])
+        self.root_split.setStretchFactor(0, 5)
+        self.root_split.setStretchFactor(1, 2)
+        self.root_split.setSizes([700, 200])
         root.addWidget(self.root_split, 1)
         self.chk_filter_current = None
 
@@ -821,6 +1156,8 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.sc_undo.setContext(Qt.WidgetWithChildrenShortcut)
         self.sc_redo = QShortcut(QKeySequence.Redo, self, activated=self._hoi_redo)
         self.sc_redo.setContext(Qt.WidgetWithChildrenShortcut)
+        self.sc_open_settings = QShortcut(QKeySequence("Ctrl+,"), self, activated=self._open_settings_dialog)
+        self.sc_open_settings.setContext(Qt.WidgetWithChildrenShortcut)
         self.apply_shortcut_settings(self._shortcut_bindings)
 
         # 3. Safely handle list_objects signals
@@ -845,7 +1182,859 @@ class HOIWindow(FrameControlMixin, QWidget):
         self._mark_hoi_saved()
 
         self._update_verb_combo()
+        self._set_verb_library_admin_mode(False)
+        self._update_draw_mode_visibility()
+        self._set_ui_scale(getattr(self, "_ui_scale", 0.85), persist=False)
+        self._apply_experiment_mode_ui()
+        self._set_validation_ui_state(False)
+        self._update_incomplete_indicator()
+        self._update_status_label()
+        self._update_next_best_query_panel()
         self._update_play_pause_button()
+
+    def _make_inspector_scroll(self, content: QWidget) -> QScrollArea:
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll.setWidget(content)
+        return scroll
+
+    def _normalized_ui_scale(self, value: Optional[float] = None) -> float:
+        try:
+            scale = float(self._ui_scale if value is None else value)
+        except Exception:
+            scale = 0.85
+        if scale > 10.0:
+            scale = scale / 100.0
+        return max(0.80, min(1.25, scale))
+
+    def _scaled_ui_px(self, base: float, min_px: int = 0) -> int:
+        try:
+            px = int(round(float(base) * self._normalized_ui_scale()))
+        except Exception:
+            px = int(round(float(base)))
+        return max(int(min_px), px)
+
+    def _reset_workspace_layout(self) -> None:
+        total_w = max(1000, int(self.width() or 0) - 20)
+        inspector_w = min(320, max(250, int(total_w * 0.23)))
+        total_h = max(720, int(self.height() or 0) - 40)
+        bottom_h = max(220, int(total_h * 0.24))
+        top_h = max(460, total_h - bottom_h)
+        try:
+            self.hoi_bottom_split.setSizes([inspector_w, max(720, total_w - inspector_w)])
+        except Exception:
+            pass
+        try:
+            self.root_split.setSizes([top_h, bottom_h])
+        except Exception:
+            pass
+
+    def _apply_logging_settings(self, oplog_enabled: bool, validation_summary_enabled: bool) -> None:
+        handled = False
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "_set_logging_policy"):
+            try:
+                parent._set_logging_policy(bool(oplog_enabled), bool(validation_summary_enabled))
+                handled = True
+            except Exception:
+                handled = False
+        if not handled:
+            self.set_logging_policy(bool(oplog_enabled), bool(validation_summary_enabled))
+            ok_save, path_or_err = save_logging_policy({
+                "ops_csv_enabled": bool(oplog_enabled),
+                "validation_summary_enabled": bool(validation_summary_enabled),
+            })
+            if not ok_save:
+                print(f"[LOG][ERROR] Failed to save logging policy: {path_or_err}")
+
+    def _set_ui_scale(self, scale: float, persist: bool = False) -> None:
+        self._ui_scale = self._normalized_ui_scale(scale)
+        self._apply_professional_ui_style()
+        self._apply_micro_interaction_icons()
+        try:
+            self.combo_experiment_mode.setMinimumWidth(self._scaled_ui_px(120, 104))
+        except Exception:
+            pass
+        try:
+            self.btn_file_menu.setFixedWidth(self._scaled_ui_px(30, 24))
+        except Exception:
+            pass
+        try:
+            self.hoi_bottom_split.setHandleWidth(self._scaled_ui_px(10, 8))
+            self.root_split.setHandleWidth(self._scaled_ui_px(10, 8))
+        except Exception:
+            pass
+        try:
+            if getattr(self, "hoi_timeline", None):
+                self.hoi_timeline.updateGeometry()
+                self.hoi_timeline.refresh()
+        except Exception:
+            pass
+        self.updateGeometry()
+        self.update()
+        if persist:
+            ok_save, path_or_err = save_ui_preferences({"ui_scale": self._ui_scale})
+            if not ok_save:
+                print(f"[UI][ERROR] Failed to save UI preferences: {path_or_err}")
+            try:
+                self._log("hoi_ui_scale_update", ui_scale=self._ui_scale)
+            except Exception:
+                pass
+
+    def _open_settings_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.resize(420, 260)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        grp_appearance = QGroupBox("Appearance", dialog)
+        form_appearance = QFormLayout(grp_appearance)
+        form_appearance.setContentsMargins(12, 12, 12, 12)
+        combo_scale = QComboBox(grp_appearance)
+        options = [
+            (0.80, "80%"),
+            (0.85, "85%"),
+            (0.90, "90%"),
+            (1.00, "100%"),
+            (1.10, "110%"),
+            (1.20, "120%"),
+        ]
+        current_scale = self._normalized_ui_scale()
+        current_idx = 0
+        best_diff = 999.0
+        for idx, (value, label) in enumerate(options):
+            combo_scale.addItem(label, value)
+            diff = abs(value - current_scale)
+            if diff < best_diff:
+                best_diff = diff
+                current_idx = idx
+        combo_scale.setCurrentIndex(current_idx)
+        form_appearance.addRow("UI Scale", combo_scale)
+        lbl_scale_hint = QLabel("Scales fonts, button density, and toolbar icons.", grp_appearance)
+        lbl_scale_hint.setObjectName("statusSubtle")
+        lbl_scale_hint.setWordWrap(True)
+        form_appearance.addRow("", lbl_scale_hint)
+        btn_reset_layout = QPushButton("Reset Layout", grp_appearance)
+        btn_reset_layout.clicked.connect(self._reset_workspace_layout)
+        form_appearance.addRow("Panels", btn_reset_layout)
+        layout.addWidget(grp_appearance)
+
+        grp_logging = QGroupBox("Evaluation Logging", dialog)
+        logging_layout = QVBoxLayout(grp_logging)
+        logging_layout.setContentsMargins(12, 12, 12, 12)
+        chk_ops = QCheckBox("Write operations CSV", grp_logging)
+        chk_ops.setChecked(bool(getattr(self.op_logger, "enabled", False)))
+        chk_validation = QCheckBox("Write validation summary", grp_logging)
+        chk_validation.setChecked(bool(getattr(self, "validation_summary_enabled", True)))
+        logging_layout.addWidget(chk_ops)
+        logging_layout.addWidget(chk_validation)
+        layout.addWidget(grp_logging)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self._set_ui_scale(float(combo_scale.currentData() or self._ui_scale), persist=True)
+        self._apply_logging_settings(chk_ops.isChecked(), chk_validation.isChecked())
+
+    def _set_verb_library_admin_mode(self, on: bool) -> None:
+        on = bool(on)
+        if hasattr(self, "label_panel") and self.label_panel:
+            self.label_panel.set_admin_visible(on)
+        act = getattr(self, "act_toggle_verb_library_admin", None)
+        if act is not None and act.isChecked() != on:
+            act.blockSignals(True)
+            act.setChecked(on)
+            act.blockSignals(False)
+
+    def _set_status_chip(self, widget: Optional[QLabel], text: str, tone: str = "neutral") -> None:
+        if widget is None:
+            return
+        palette = {
+            "neutral": ("#EEF2FF", "#3730A3"),
+            "ok": ("#ECFDF3", "#027A48"),
+            "warn": ("#FFFAEB", "#B54708"),
+            "danger": ("#FEF3F2", "#B42318"),
+        }
+        bg, fg = palette.get(tone, palette["neutral"])
+        widget.setText(text)
+        widget.setStyleSheet(
+            f"background: {bg}; color: {fg}; border: 1px solid {bg}; border-radius: 999px; padding: 3px 10px; font-weight: 600;"
+        )
+
+    def _set_status_card_tone(self, widget: Optional[QFrame], tone: str = "neutral") -> None:
+        if widget is None:
+            return
+        palette = {
+            "neutral": ("#F8FAFC", "#E4E7EC"),
+            "active": ("#EFF6FF", "#93C5FD"),
+            "ok": ("#F0FDF4", "#86EFAC"),
+            "warn": ("#FFFBEB", "#FCD34D"),
+            "danger": ("#FEF2F2", "#FCA5A5"),
+        }
+        bg, border = palette.get(tone, palette["neutral"])
+        widget.setStyleSheet(
+            f"background: {bg}; border: 1px solid {border}; border-radius: 10px;"
+        )
+
+    def _focus_inspector_tab(self, name: str) -> None:
+        tabs = getattr(self, "inspector_tabs", None)
+        if tabs is None:
+            return
+        key = str(name or "").strip().lower()
+        mapping = {"event": 0, "objects": 1, "review": 2}
+        idx = mapping.get(key)
+        if idx is not None and 0 <= idx < tabs.count():
+            tabs.setCurrentIndex(idx)
+
+    def _update_inspector_tab_labels(self) -> None:
+        tabs = getattr(self, "inspector_tabs", None)
+        if tabs is None or tabs.count() < 3:
+            return
+        event_text = "Event"
+        if self.selected_event_id is not None:
+            event_text += " *"
+        object_list = getattr(self, "list_objects", None)
+        object_count = int(object_list.count()) if object_list is not None else 0
+        objects_text = f"Objects ({object_count})" if object_count > 0 else "Objects"
+        issue_count = len(getattr(self, "_incomplete_issues", []) or [])
+        review_text = f"Review ({issue_count})" if issue_count > 0 else "Review"
+        tabs.setTabText(0, event_text)
+        tabs.setTabText(1, objects_text)
+        tabs.setTabText(2, review_text)
+
+    def _apply_micro_interaction_icons(self) -> None:
+        style = self.style()
+        icon_px = self._scaled_ui_px(18, 14)
+        transport_w = self._scaled_ui_px(32, 26)
+        chrome_w = self._scaled_ui_px(30, 24)
+        try:
+            self.btn_file_menu.setIcon(style.standardIcon(QStyle.SP_DialogOpenButton))
+            self.btn_file_menu.setText("")
+            self.btn_file_menu.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self.btn_file_menu.setIconSize(QSize(icon_px, icon_px))
+            self.btn_file_menu.setFixedWidth(chrome_w)
+            self.btn_file_menu.setAutoRaise(True)
+        except Exception:
+            pass
+        try:
+            for button in (self.btn_rew, self.btn_play, self.btn_stop, self.btn_ff):
+                button.setIconSize(QSize(icon_px, icon_px))
+                button.setFixedWidth(transport_w)
+                button.setAutoRaise(True)
+            self.btn_jump.setFixedWidth(self._scaled_ui_px(28, 24))
+        except Exception:
+            pass
+        try:
+            self.btn_suggest_action_label.setIcon(
+                style.standardIcon(QStyle.SP_BrowserReload)
+            )
+            self.btn_suggest_action_label.setText("")
+            self.btn_suggest_action_label.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self.btn_suggest_action_label.setIconSize(QSize(icon_px, icon_px))
+            self.btn_suggest_action_label.setAutoRaise(True)
+        except Exception:
+            pass
+        try:
+            self.btn_object_tools.setText("?")
+            self.btn_object_tools.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            self.btn_object_tools.setAutoRaise(True)
+            self.btn_action_tools.setText("...")
+            self.btn_action_tools.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            self.btn_action_tools.setAutoRaise(True)
+        except Exception:
+            pass
+
+    def _query_surface_tone(self, surface: str) -> str:
+        key = str(surface or "").strip().lower()
+        if key == "event":
+            return "active"
+        if key == "objects":
+            return "warn"
+        if key == "review":
+            return "danger"
+        return "neutral"
+
+    def _query_surface_chip_tone(self, surface: str) -> str:
+        key = str(surface or "").strip().lower()
+        if key == "event":
+            return "neutral"
+        if key == "objects":
+            return "warn"
+        if key == "review":
+            return "danger"
+        return "neutral"
+
+    def _build_hoi_query_rows(self) -> List[dict]:
+        rows: List[dict] = []
+        graph = build_hoi_event_graph(
+            self.events,
+            video_path=self.video_path,
+            annotation_path="",
+            actors_config=self.actors_config,
+        )
+        consistency_by_key: Dict[tuple, List[dict]] = {}
+        for item in list(graph.get("consistency_flags", []) or []):
+            if not isinstance(item, dict):
+                continue
+            key = (item.get("event_id"), item.get("actor_id") or item.get("hand"))
+            consistency_by_key.setdefault(key, []).append(dict(item))
+
+        for event in self.events:
+            event_id = event.get("event_id")
+            event_candidates = self._normalize_videomae_candidates(
+                event.get("videomae_top5")
+            )
+            for actor in self.actors_config:
+                hand_key = actor["id"]
+                hand_data = event.get("hoi_data", {}).get(hand_key, {}) or {}
+                self._hydrate_hand_annotation_state(
+                    hand_data, default_source="loaded_annotation"
+                )
+                state = copy.deepcopy(hand_data.get("_field_state", {}) or {})
+                suggestions = copy.deepcopy(
+                    hand_data.get("_field_suggestions", {}) or {}
+                )
+                start = hand_data.get("interaction_start")
+                onset = hand_data.get("functional_contact_onset")
+                end = hand_data.get("interaction_end")
+                verb = hand_data.get("verb")
+                inst = hand_data.get("instrument_object_id")
+                target = hand_data.get("target_object_id")
+                has_info = any(
+                    (
+                        start is not None,
+                        onset is not None,
+                        end is not None,
+                        bool(str(verb or "").strip()),
+                        inst is not None,
+                        target is not None,
+                        bool(suggestions),
+                    )
+                )
+                if not has_info:
+                    continue
+
+                labels = self._parse_anomaly_labels(hand_data.get("anomaly_label"))
+                allow_missing_bbox = self._anomaly_rule_allows(
+                    labels, "allow_missing_bbox"
+                )
+                sparse_evidence = self._sparse_evidence_summary(hand_data)
+                bbox_errors = (
+                    []
+                    if allow_missing_bbox
+                    else list(self._validate_integrity(hand_data) or [])
+                )
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "hand": hand_key,
+                        "interaction_start": start,
+                        "functional_contact_onset": onset,
+                        "interaction_end": end,
+                        "verb": verb,
+                        "instrument_object_id": inst,
+                        "target_object_id": target,
+                        "field_state": state,
+                        "field_suggestions": suggestions,
+                        "bbox_errors": bbox_errors,
+                        "sparse_evidence_state": copy.deepcopy(
+                            sparse_evidence.get("state", {}) or {}
+                        ),
+                        "sparse_evidence_summary": {
+                            "expected": int(sparse_evidence.get("expected", 0) or 0),
+                            "confirmed": int(
+                                sparse_evidence.get("confirmed", 0) or 0
+                            ),
+                            "missing": int(sparse_evidence.get("missing", 0) or 0),
+                            "blocked": int(sparse_evidence.get("blocked", 0) or 0),
+                        },
+                        "allow_missing_bbox": bool(allow_missing_bbox),
+                        "videomae_candidates": list(event_candidates or []),
+                        "consistency_flags": list(
+                            consistency_by_key.get((event_id, hand_key), []) or []
+                        ),
+                    }
+                )
+        return rows
+
+    def _update_next_best_query_panel(self) -> None:
+        if not hasattr(self, "lbl_next_query_summary"):
+            return
+        queries = build_query_candidates(
+            self._build_hoi_query_rows(),
+            selected_event_id=self.selected_event_id,
+            selected_hand=self.selected_hand_label,
+        )
+        best = dict(queries[0]) if queries else None
+        self._next_best_query = best
+        if not best:
+            self._next_best_query_id = ""
+            self._next_best_query_presented_at = 0.0
+            self.lbl_next_query_title.setText("Next Best Query")
+            self.lbl_next_query_summary.setText("No pending high-value query.")
+            self.lbl_next_query_reason.setText(
+                "All current HOI fields are either confirmed or intentionally left unresolved."
+            )
+            self.lbl_next_query_evidence.setText("Sparse evidence: all active keyframe slots are currently grounded.")
+            self._set_status_chip(
+                getattr(self, "lbl_next_query_surface_chip", None), "Idle", "neutral"
+            )
+            self._set_status_chip(
+                getattr(self, "lbl_next_query_score_chip", None), "VOI --", "neutral"
+            )
+            self._set_status_chip(
+                getattr(self, "lbl_next_query_prop_chip", None), "Prop --", "neutral"
+            )
+            self._set_status_chip(
+                getattr(self, "lbl_next_query_cost_chip", None), "Cost --", "neutral"
+            )
+            self._set_status_chip(
+                getattr(self, "lbl_next_query_risk_chip", None), "Risk --", "neutral"
+            )
+            self._set_status_card_tone(getattr(self, "next_query_card", None), "neutral")
+            self.btn_next_query_focus.setEnabled(False)
+            self.btn_next_query_apply.setEnabled(False)
+            self.btn_next_query_apply.setText("Apply")
+            return
+
+        surface = str(best.get("surface") or "review").strip().title()
+        event_id = best.get("event_id")
+        hand = self._get_actor_short_label(best.get("hand"))
+        query_id = str(best.get("query_id") or "").strip()
+        if query_id and query_id != self._next_best_query_id:
+            self._next_best_query_id = query_id
+            self._next_best_query_presented_at = time.time()
+            self._log(
+                "hoi_query_present",
+                query_id=query_id,
+                query_type=best.get("query_type"),
+                event_id=event_id,
+                hand=best.get("hand"),
+                surface=best.get("surface"),
+                field=best.get("field_name"),
+                target_frame=best.get("target_frame"),
+                target_slot=best.get("target_slot"),
+                voi_score=best.get("voi_score"),
+                propagation_gain=best.get("propagation_gain"),
+                human_cost_est=best.get("human_cost_est"),
+                overwrite_risk=best.get("overwrite_risk"),
+            )
+        summary = str(best.get("summary") or "").strip()
+        reason = str(best.get("reason") or "").strip()
+        voi = float(best.get("voi_score", 0.0) or 0.0)
+        propagation = float(best.get("propagation_gain", 0.0) or 0.0)
+        cost = float(best.get("human_cost_est", 0.0) or 0.0)
+        risk = float(best.get("overwrite_risk", 0.0) or 0.0)
+        evidence_summary = dict(best.get("sparse_evidence_summary") or {})
+        evidence_expected = int(evidence_summary.get("expected", 0) or 0)
+        evidence_confirmed = int(evidence_summary.get("confirmed", 0) or 0)
+        evidence_missing = int(evidence_summary.get("missing", 0) or 0)
+        location = f"Event {event_id} {hand}" if event_id is not None else hand
+        self.lbl_next_query_title.setText(f"Next Best Query  {location}".strip())
+        self.lbl_next_query_summary.setText(summary or "Review the next supervision step.")
+        self.lbl_next_query_reason.setText(reason or "Controller-selected high-value supervision step.")
+        if evidence_expected > 0:
+            self.lbl_next_query_evidence.setText(
+                f"Sparse evidence: {evidence_confirmed}/{evidence_expected} grounded, {evidence_missing} still missing."
+            )
+        else:
+            self.lbl_next_query_evidence.setText(
+                "Sparse evidence: waiting for object links and keyframes before grounding can begin."
+            )
+        self._set_status_chip(
+            getattr(self, "lbl_next_query_surface_chip", None),
+            surface,
+            self._query_surface_chip_tone(surface),
+        )
+        self._set_status_chip(
+            getattr(self, "lbl_next_query_score_chip", None),
+            f"VOI {voi:.2f}",
+            "neutral",
+        )
+        self._set_status_chip(
+            getattr(self, "lbl_next_query_prop_chip", None),
+            f"Prop {propagation:.2f}",
+            "ok" if propagation >= 0.85 else "neutral",
+        )
+        self._set_status_chip(
+            getattr(self, "lbl_next_query_cost_chip", None),
+            f"Cost {cost:.2f}",
+            "warn" if cost >= 0.5 else "neutral",
+        )
+        self._set_status_chip(
+            getattr(self, "lbl_next_query_risk_chip", None),
+            f"Risk {risk:.2f}",
+            "danger" if risk >= 0.3 else "neutral",
+        )
+        self._set_status_card_tone(
+            getattr(self, "next_query_card", None),
+            self._query_surface_tone(surface),
+        )
+        self.btn_next_query_focus.setEnabled(True)
+        can_apply = bool(best.get("safe_apply"))
+        self.btn_next_query_apply.setEnabled(can_apply)
+        if best.get("apply_mode") == "confirm_current":
+            self.btn_next_query_apply.setText("Confirm Current")
+        else:
+            self.btn_next_query_apply.setText("Apply Suggestion")
+
+    def _focus_query_candidate(self, query: Optional[dict]) -> None:
+        if not query:
+            return
+        event_id = query.get("event_id")
+        hand = query.get("hand")
+        if event_id is not None and hand:
+            self._set_selected_event(int(event_id), str(hand))
+        surface = str(query.get("surface") or "").strip().lower()
+        if surface:
+            self._focus_inspector_tab(surface)
+        frame = query.get("target_frame")
+        if frame is not None and self.player.cap:
+            try:
+                target = int(frame)
+                self.player.seek(target)
+                self._refresh_boxes_for_frame(target)
+                self._set_frame_controls(target)
+            except Exception:
+                pass
+        latency_ms = None
+        query_id = str(query.get("query_id") or "").strip()
+        if query_id and query_id == getattr(self, "_next_best_query_id", ""):
+            presented_at = float(getattr(self, "_next_best_query_presented_at", 0.0) or 0.0)
+            if presented_at > 0:
+                latency_ms = int(max(0.0, (time.time() - presented_at) * 1000.0))
+        self._log(
+            "hoi_query_focus",
+            query_id=query_id,
+            query_type=query.get("query_type"),
+            event_id=event_id,
+            hand=hand,
+            surface=surface,
+            field=query.get("field_name"),
+            target_frame=query.get("target_frame"),
+            target_slot=query.get("target_slot"),
+            voi_score=query.get("voi_score"),
+            propagation_gain=query.get("propagation_gain"),
+            human_cost_est=query.get("human_cost_est"),
+            overwrite_risk=query.get("overwrite_risk"),
+            query_latency_ms=latency_ms,
+        )
+
+    def _focus_next_best_query(self) -> None:
+        self._focus_query_candidate(getattr(self, "_next_best_query", None))
+
+    def _apply_query_suggestion(self, query: Optional[dict]) -> bool:
+        if not query or not bool(query.get("safe_apply")):
+            return False
+        event_id = query.get("event_id")
+        hand_key = query.get("hand")
+        field_name = str(query.get("field_name") or "").strip()
+        apply_mode = str(query.get("apply_mode") or "").strip()
+        if event_id is None or not hand_key or not field_name:
+            return False
+        event = self._find_event_by_id(int(event_id))
+        if not event:
+            return False
+        hand_data = event.get("hoi_data", {}).get(hand_key, {}) or {}
+        self._ensure_hand_annotation_state(hand_data)
+        draft = None
+        if self.selected_event_id == int(event_id) and hand_key in self.event_draft:
+            draft = self.event_draft.get(hand_key, {})
+            self._ensure_hand_annotation_state(draft)
+
+        applied = False
+        if apply_mode == "confirm_current":
+            state = get_field_state(hand_data, field_name)
+            if state.get("status") != "confirmed":
+                self._set_hand_field_state(
+                    hand_data,
+                    field_name,
+                    source="query_confirm",
+                    status="confirmed",
+                )
+                if isinstance(draft, dict):
+                    self._set_hand_field_state(
+                        draft,
+                        field_name,
+                        source="query_confirm",
+                        status="confirmed",
+                    )
+                applied = True
+        elif apply_mode == "apply_suggestion":
+            suggested_value = query.get("suggested_value")
+            suggested_source = (
+                str(query.get("suggested_source") or "").strip() or "query_controller"
+            )
+            reason = str(query.get("reason") or "").strip()
+            confidence = query.get("suggested_confidence")
+            if get_field_state(hand_data, field_name).get("status") != "confirmed":
+                self._suggest_hand_field(
+                    hand_data,
+                    field_name,
+                    suggested_value,
+                    source=suggested_source,
+                    confidence=confidence,
+                    reason=reason,
+                    safe_to_apply=True,
+                )
+                applied = apply_field_suggestion(
+                    hand_data,
+                    field_name,
+                    source=suggested_source,
+                    as_status="suggested",
+                )
+                if applied and isinstance(draft, dict):
+                    self._suggest_hand_field(
+                        draft,
+                        field_name,
+                        suggested_value,
+                        source=suggested_source,
+                        confidence=confidence,
+                        reason=reason,
+                        safe_to_apply=True,
+                    )
+                    apply_field_suggestion(
+                        draft,
+                        field_name,
+                        source=suggested_source,
+                        as_status="suggested",
+                    )
+
+        if not applied:
+            return False
+
+        latency_ms = None
+        query_id = str(query.get("query_id") or "").strip()
+        if query_id and query_id == getattr(self, "_next_best_query_id", ""):
+            presented_at = float(getattr(self, "_next_best_query_presented_at", 0.0) or 0.0)
+            if presented_at > 0:
+                latency_ms = int(max(0.0, (time.time() - presented_at) * 1000.0))
+        self._sync_event_frames(event)
+        if field_name == "verb":
+            if self.selected_event_id == int(event_id) and self.selected_hand_label == hand_key:
+                self._load_hand_draft_to_ui(hand_key)
+            self._update_action_top5_display(int(event_id))
+        else:
+            if self.selected_event_id == int(event_id) and self.selected_hand_label == hand_key:
+                self._update_status_label()
+        self._refresh_events()
+        if getattr(self, "hoi_timeline", None):
+            self.hoi_timeline.refresh()
+        self._log(
+            "hoi_query_apply",
+            query_id=query_id,
+            query_type=query.get("query_type"),
+            event_id=event_id,
+            hand=hand_key,
+            field=field_name,
+            apply_mode=apply_mode,
+            target_frame=query.get("target_frame"),
+            target_slot=query.get("target_slot"),
+            voi_score=query.get("voi_score"),
+            propagation_gain=query.get("propagation_gain"),
+            human_cost_est=query.get("human_cost_est"),
+            overwrite_risk=query.get("overwrite_risk"),
+            resolve_kind="safe_apply",
+            query_latency_ms=latency_ms,
+        )
+        return True
+
+    def _apply_next_best_query(self) -> None:
+        if not self._apply_query_suggestion(getattr(self, "_next_best_query", None)):
+            QMessageBox.information(
+                self,
+                "Next Best Query",
+                "This query requires explicit user confirmation rather than a safe local completion.",
+            )
+
+    def _update_draw_mode_visibility(self) -> None:
+        draw_widget = getattr(self, "draw_mode_widget", None)
+        if draw_widget is not None:
+            draw_widget.setVisible(bool(getattr(self, "chk_edit_boxes", None) and self.chk_edit_boxes.isChecked()))
+
+    def _preferred_base_font_pt(self) -> float:
+        app = QApplication.instance()
+        base_font = app.font() if app is not None else self.font()
+        try:
+            size = float(base_font.pointSizeF())
+        except Exception:
+            size = float(base_font.pointSize() or 0)
+        if size <= 0:
+            size = 8.0
+        scaled = size * self._normalized_ui_scale()
+        return max(6.8, min(8.4, scaled))
+
+    def _apply_professional_ui_style(self) -> None:
+        body_pt = self._preferred_base_font_pt()
+        caption_pt = max(6.3, body_pt - 0.30)
+        title_pt = body_pt
+        scale = self._normalized_ui_scale()
+        group_margin_top = self._scaled_ui_px(12, 10)
+        group_pad_top = self._scaled_ui_px(4, 3)
+        tab_pad_v = self._scaled_ui_px(3, 2)
+        tab_pad_h = self._scaled_ui_px(8, 6)
+        tab_min_w = self._scaled_ui_px(52, 48)
+        control_h = self._scaled_ui_px(22, 20)
+        control_radius = self._scaled_ui_px(7, 6)
+        control_pad_v = self._scaled_ui_px(1.5, 1)
+        control_pad_h = self._scaled_ui_px(5, 4)
+        compact_h = self._scaled_ui_px(19, 17)
+        compact_pad_h = self._scaled_ui_px(5, 4)
+        list_item_h = self._scaled_ui_px(22, 20)
+        slider_handle = self._scaled_ui_px(14, 12)
+        slider_margin = self._scaled_ui_px(5, 4)
+        font = self.font()
+        try:
+            current_size = float(font.pointSizeF())
+        except Exception:
+            current_size = float(font.pointSize() or 0)
+        if abs(current_size - body_pt) > 0.05:
+            font.setPointSizeF(body_pt)
+            self.setFont(font)
+        self.setStyleSheet(
+            f"""
+            QFrame#toolbarFrame {{
+                background: #F8FAFC;
+                border: 1px solid #E4E7EC;
+                border-radius: 10px;
+            }}
+            QWidget, QFrame, QLabel, QGroupBox, QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QListWidget, QTabWidget {{
+                font-family: "Segoe UI", "Microsoft YaHei UI", "Tahoma", "Arial";
+            }}
+            QGroupBox {{
+                background: #FFFFFF;
+                border: 1px solid #D9DEE7;
+                border-radius: 10px;
+                margin-top: {group_margin_top}px;
+                padding-top: {group_pad_top}px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+                color: #344054;
+                font-weight: 600;
+            }}
+            QLabel#captionLabel {{
+                color: #667085;
+                font-size: {caption_pt:.1f}pt;
+                font-weight: 600;
+                text-transform: uppercase;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid #D9DEE7;
+                background: #FFFFFF;
+                border-radius: 10px;
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background: #F2F4F7;
+                border: 1px solid #D0D5DD;
+                border-bottom: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: {tab_pad_v}px {tab_pad_h}px;
+                margin-right: 4px;
+                color: #475467;
+                min-width: {tab_min_w}px;
+            }}
+            QTabBar::tab:selected {{
+                background: #FFFFFF;
+                color: #101828;
+                font-weight: 600;
+            }}
+            QSplitter::handle {{
+                background: #E4E7EC;
+                border-radius: 4px;
+            }}
+            QSplitter::handle:hover {{
+                background: #CBD5E1;
+            }}
+            QSplitter::handle:horizontal {{
+                width: 10px;
+                margin: 0 1px;
+            }}
+            QSplitter::handle:vertical {{
+                height: 10px;
+                margin: 1px 0;
+            }}
+            QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox {{
+                min-height: {control_h}px;
+                border: 1px solid #D0D5DD;
+                border-radius: {control_radius}px;
+                background: #FFFFFF;
+                padding: {control_pad_v}px {control_pad_h}px;
+            }}
+            QScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            QFrame#statusCard {{
+                background: #F8FAFC;
+                border: 1px solid #E4E7EC;
+                border-radius: 10px;
+            }}
+            QLabel#statusTitle {{
+                color: #101828;
+                font-size: {title_pt:.1f}pt;
+                font-weight: 700;
+            }}
+            QLabel#statusSubtle {{
+                color: #667085;
+            }}
+            QPushButton[compactChip="true"] {{
+                min-height: {compact_h}px;
+                padding: {control_pad_v}px {compact_pad_h}px;
+            }}
+            QPushButton:hover, QToolButton:hover {{
+                background: #F9FAFB;
+            }}
+            QPushButton:disabled, QToolButton:disabled, QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{
+                color: #98A2B3;
+                background: #F2F4F7;
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+                width: 0px;
+            }}
+            QListWidget {{
+                border: 1px solid #D0D5DD;
+                border-radius: 8px;
+                background: #FFFFFF;
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                min-height: {control_h}px;
+            }}
+            QListWidget::item:selected {{
+                background: #E0EAFF;
+                color: #0F172A;
+                border-radius: 6px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 6px;
+                background: #E4E7EC;
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                width: {slider_handle}px;
+                margin: -{slider_margin}px 0;
+                background: #2563EB;
+                border-radius: {control_radius}px;
+            }}
+            """
+        )
 
     def _set_shortcut_key(
         self, shortcut: Optional[QShortcut], sid: str, default_key: str
@@ -938,8 +2127,11 @@ class HOIWindow(FrameControlMixin, QWidget):
         idx = self.combo_verb.findText(current)
         if idx >= 0:
             self.combo_verb.setCurrentIndex(idx)
+        elif current:
+            self.combo_verb.setCurrentText(current)
 
         self.combo_verb.blockSignals(False)
+        self._sync_action_panel_selection(self.combo_verb.currentText())
 
     def _hoi_color_for_verb(self, verb: str) -> Optional[QColor]:
         for v in self.verbs:
@@ -1028,6 +2220,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                     hand_key = aid
                     break
         self.selected_hand_label = hand_key
+        self.selected_event_id = event_id
 
         for aid, chk in self.actor_controls.items():
             chk.blockSignals(True)
@@ -1037,13 +2230,13 @@ class HOIWindow(FrameControlMixin, QWidget):
         self._load_hand_draft_to_ui(hand_key)
         self._update_status_label()
         self.list_objects.setEnabled(True)
-        self.selected_event_id = event_id
 
         if hasattr(self, "hoi_timeline") and self.hoi_timeline:
             self.hoi_timeline.set_selected(event_id, hand_key)
             self.hoi_timeline.refresh()
-            
+
         self._update_action_top5_display(event_id)
+        self._queue_action_label_refresh(event_id, delay_ms=250)
         self._update_overlay(self.player.current_frame)
         self._update_hoi_titles()
 
@@ -1154,12 +2347,12 @@ class HOIWindow(FrameControlMixin, QWidget):
         return actor_id
 
     def _hoi_title_for_hand(self, hand_key: str) -> str:
-        base = self._get_actor_short_label(hand_key)
+        base = self._get_actor_full_label(hand_key)
         if self.selected_event_id is None:
-            return base
+            return f"{base}\nIdle"
         ev = self._find_event_by_id(self.selected_event_id)
         if not ev:
-            return base
+            return f"{base}\nIdle"
         h_data = {}
         if isinstance(getattr(self, "event_draft", None), dict):
             h_data = self.event_draft.get(hand_key, {}) or {}
@@ -1175,16 +2368,25 @@ class HOIWindow(FrameControlMixin, QWidget):
                 h_data.get("target_object_id") is not None,
             ]
         )
-        check = "\u2713" if has_data else "\u25a1"
-        verb = h_data.get("verb") or "_"
-        tool = self._object_name_for_id(
-            h_data.get("instrument_object_id"), default_for_none="_"
-        )
-        target = self._object_name_for_id(
-            h_data.get("target_object_id"), default_for_none="_"
-        )
-        return f"{base} {check} | Verb: {verb}, Tool: {tool}, Target: {target}"
-
+        if not has_data:
+            return f"{base}\nIdle"
+        missing = []
+        if h_data.get("interaction_start") is None or h_data.get("interaction_end") is None:
+            missing.append("time")
+        if h_data.get("functional_contact_onset") is None:
+            missing.append("onset")
+        if not h_data.get("verb"):
+            missing.append("verb")
+        if h_data.get("instrument_object_id") is None:
+            missing.append("inst")
+        if h_data.get("target_object_id") is None:
+            missing.append("target")
+        if missing:
+            status = "Missing " + "/".join(missing[:2])
+        else:
+            verb = str(h_data.get("verb") or "").strip()
+            status = verb if verb else "Ready"
+        return f"{base}\n{status}"
     def _update_hoi_titles(self):
         if getattr(self, "hoi_timeline", None):
             self.hoi_timeline.update_titles()
@@ -1197,8 +2399,234 @@ class HOIWindow(FrameControlMixin, QWidget):
             "anomaly_label": self._selected_anomaly_label(),
         }
 
-    def _blank_hand_data(self) -> dict:
+    def _ensure_hand_annotation_state(self, hand_data: Optional[dict]) -> dict:
+        if not isinstance(hand_data, dict):
+            hand_data = {}
+        return ensure_hand_annotation_state(hand_data)
+
+    def _hydrate_hand_annotation_state(
+        self, hand_data: Optional[dict], default_source: str = "loaded_annotation"
+    ) -> dict:
+        if not isinstance(hand_data, dict):
+            hand_data = {}
+        return hydrate_existing_field_state(hand_data, default_source=default_source)
+
+    def _set_pending_field_source(self, field_name: str, source: str) -> None:
+        field_name = str(field_name or "").strip()
+        if field_name:
+            self._pending_field_sources[field_name] = str(source or "").strip() or "manual_ui"
+
+    def _consume_pending_field_source(self, field_name: str, default: str) -> str:
+        field_name = str(field_name or "").strip()
+        if not field_name:
+            return default
+        source = self._pending_field_sources.pop(field_name, None)
+        return str(source or default).strip() or default
+
+    def _set_hand_field_state(
+        self,
+        hand_data: Optional[dict],
+        field_name: str,
+        *,
+        source: str,
+        value: Any = _UNSET,
+        status: str = "confirmed",
+        note: str = "",
+    ) -> None:
+        if not isinstance(hand_data, dict):
+            return
+        set_field_confirmation(
+            hand_data,
+            field_name,
+            source=source,
+            value=value,
+            status=status,
+            note=note,
+        )
+
+    def _suggest_hand_field(
+        self,
+        hand_data: Optional[dict],
+        field_name: str,
+        value: Any,
+        *,
+        source: str,
+        confidence: Optional[float] = None,
+        reason: str = "",
+        safe_to_apply: bool = True,
+    ) -> None:
+        if not isinstance(hand_data, dict):
+            return
+        set_field_suggestion(
+            hand_data,
+            field_name,
+            value,
+            source=source,
+            confidence=confidence,
+            reason=reason,
+            safe_to_apply=safe_to_apply,
+        )
+
+    def _clear_hand_field(self, hand_data: Optional[dict], field_name: str, source: str = "manual_clear") -> None:
+        if not isinstance(hand_data, dict):
+            return
+        clear_field_value(hand_data, field_name, source=source)
+
+    def _box_source(self, box: Optional[dict], default: str = "unknown_box") -> str:
+        if not isinstance(box, dict):
+            return default
+        return str(box.get("source") or default).strip() or default
+
+    def _compute_sparse_evidence_state(self, hand_data: Optional[dict]) -> dict:
+        if not isinstance(hand_data, dict):
+            return {}
+        point_defs = (
+            ("start", "interaction_start", "Start"),
+            ("onset", "functional_contact_onset", "Onset"),
+            ("end", "interaction_end", "End"),
+        )
+        role_defs = (
+            ("instrument", "instrument_object_id", "Instrument"),
+            ("target", "target_object_id", "Target"),
+        )
+        states = {}
+        for role_slug, object_key, role_label in role_defs:
+            obj_id = hand_data.get(object_key)
+            obj_name = self._object_name_for_id(obj_id, default_for_none="", fallback="")
+            for point_slug, time_key, time_label in point_defs:
+                slot = f"{role_slug}_{point_slug}"
+                frame = hand_data.get(time_key)
+                base = {
+                    "slot": slot,
+                    "role": role_slug,
+                    "role_label": role_label,
+                    "time_key": point_slug,
+                    "time_label": time_label,
+                    "frame": _safe_int(frame),
+                    "object_id": obj_id,
+                    "object_name": obj_name,
+                }
+                if obj_id is None or frame is None:
+                    states[slot] = {
+                        **base,
+                        "status": "blocked",
+                        "source": "missing_context",
+                        "note": "Sparse evidence becomes active once both the object link and keyframe exist.",
+                    }
+                    continue
+                try:
+                    frame_int = int(frame)
+                except Exception:
+                    states[slot] = {
+                        **base,
+                        "status": "blocked",
+                        "source": "invalid_frame",
+                        "note": "The keyframe is not valid yet.",
+                    }
+                    continue
+                match = None
+                for box in self.bboxes.get(frame_int, []) or []:
+                    if box.get("id") == obj_id:
+                        match = box
+                        break
+                if match is not None:
+                    states[slot] = {
+                        **base,
+                        "status": "confirmed",
+                        "source": self._box_source(match, default="box_observed"),
+                        "note": f"{role_label} evidence observed on the {time_label.lower()} keyframe.",
+                    }
+                else:
+                    states[slot] = {
+                        **base,
+                        "status": "missing",
+                        "source": "missing_evidence",
+                        "note": f"No {role_slug} box was found on the {time_label.lower()} keyframe.",
+                    }
+        hand_data["_sparse_evidence_state"] = copy.deepcopy(states)
+        return states
+
+    def _sparse_evidence_summary(self, hand_data: Optional[dict]) -> dict:
+        state = self._compute_sparse_evidence_state(hand_data)
+        expected = 0
+        confirmed = 0
+        missing = 0
+        blocked = 0
+        for row in list(state.values()):
+            status = str((row or {}).get("status") or "").strip().lower()
+            if status == "blocked":
+                blocked += 1
+                continue
+            expected += 1
+            if status == "confirmed":
+                confirmed += 1
+            elif status == "missing":
+                missing += 1
         return {
+            "expected": expected,
+            "confirmed": confirmed,
+            "missing": missing,
+            "blocked": blocked,
+            "state": state,
+        }
+
+    def _refresh_sparse_evidence_snapshots(self) -> None:
+        for event in list(self.events or []):
+            hoi_data = event.get("hoi_data", {}) or {}
+            if not isinstance(hoi_data, dict):
+                continue
+            for actor in self.actors_config:
+                hand_key = actor["id"]
+                hand_data = hoi_data.get(hand_key)
+                if isinstance(hand_data, dict):
+                    self._compute_sparse_evidence_state(hand_data)
+        for hand_key, hand_data in list((getattr(self, "event_draft", {}) or {}).items()):
+            if isinstance(hand_data, dict):
+                self._compute_sparse_evidence_state(hand_data)
+
+    def _sync_event_videomae_suggestions(
+        self, event_id: int, event: Optional[dict], candidates: List[dict]
+    ) -> None:
+        if not event or not candidates:
+            return
+        top = dict(candidates[0] or {})
+        label = str(top.get("label") or "").strip()
+        if not label:
+            return
+        confidence = top.get("score")
+        reason = "VideoMAE top-1 candidate for the current action segment."
+        for actor in self.actors_config:
+            hand_key = actor["id"]
+            hand_data = event.get("hoi_data", {}).get(hand_key, {}) or {}
+            self._ensure_hand_annotation_state(hand_data)
+            state = get_field_state(hand_data, "verb")
+            current = str(hand_data.get("verb") or "").strip()
+            if state.get("status") == "confirmed" and current:
+                continue
+            self._suggest_hand_field(
+                hand_data,
+                "verb",
+                label,
+                source="videomae_top1",
+                confidence=confidence,
+                reason=reason,
+                safe_to_apply=True,
+            )
+            if self.selected_event_id == event_id and hand_key in self.event_draft:
+                draft = self.event_draft.get(hand_key, {})
+                self._ensure_hand_annotation_state(draft)
+                self._suggest_hand_field(
+                    draft,
+                    "verb",
+                    label,
+                    source="videomae_top1",
+                    confidence=confidence,
+                    reason=reason,
+                    safe_to_apply=True,
+                )
+
+    def _blank_hand_data(self) -> dict:
+        hand_data = {
             "verb": "",
             "instrument_object_id": None,
             "target_object_id": None,
@@ -1207,9 +2635,11 @@ class HOIWindow(FrameControlMixin, QWidget):
             "interaction_end": None,
             "anomaly_label": self.extra_label_config.get("default_label", "Normal"),
         }
+        return self._ensure_hand_annotation_state(hand_data)
 
     def _on_hoi_timeline_select(self, event_id: int, hand_key: str):
         self._set_selected_event(event_id, hand_key)
+        self._focus_inspector_tab("event")
 
     def _on_hoi_timeline_update(
         self, event_id: int, hand_key: str, start: int, end: int, onset: int
@@ -1219,9 +2649,22 @@ class HOIWindow(FrameControlMixin, QWidget):
             return
         self._push_undo()
         h = ev.get("hoi_data", {}).setdefault(hand_key, self._blank_hand_data())
+        self._ensure_hand_annotation_state(h)
         h["interaction_start"] = int(start)
         h["interaction_end"] = int(end)
         h["functional_contact_onset"] = int(onset)
+        self._set_hand_field_state(
+            h, "interaction_start", source="manual_timeline", status="confirmed"
+        )
+        self._set_hand_field_state(
+            h, "interaction_end", source="manual_timeline", status="confirmed"
+        )
+        self._set_hand_field_state(
+            h,
+            "functional_contact_onset",
+            source="manual_timeline",
+            status="confirmed",
+        )
         if h.get("anomaly_label") in (None, ""):
             h["anomaly_label"] = self.extra_label_config.get("default_label", "Normal")
         self._sync_event_frames(ev)
@@ -1230,6 +2673,10 @@ class HOIWindow(FrameControlMixin, QWidget):
             self._update_status_label()
         self._refresh_events()
         self.hoi_timeline.refresh()
+        self._invalidate_videomae_candidates(event_id)
+        if self.selected_event_id == event_id:
+            self._update_action_top5_display(event_id)
+            self._queue_action_label_refresh(event_id, delay_ms=450)
         self._log(
             "hoi_event_edit_frames",
             event_id=event_id,
@@ -1258,6 +2705,36 @@ class HOIWindow(FrameControlMixin, QWidget):
         hand_data["interaction_start"] = int(start)
         hand_data["interaction_end"] = int(end)
         hand_data["functional_contact_onset"] = int(onset)
+        self._set_hand_field_state(
+            hand_data, "interaction_start", source="manual_timeline", status="confirmed"
+        )
+        self._set_hand_field_state(
+            hand_data, "interaction_end", source="manual_timeline", status="confirmed"
+        )
+        self._set_hand_field_state(
+            hand_data,
+            "functional_contact_onset",
+            source="manual_timeline",
+            status="confirmed",
+        )
+        if str(hand_data.get("verb") or "").strip():
+            self._set_hand_field_state(
+                hand_data, "verb", source="manual_create", status="confirmed"
+            )
+        if hand_data.get("instrument_object_id") is not None:
+            self._set_hand_field_state(
+                hand_data,
+                "instrument_object_id",
+                source="manual_create",
+                status="confirmed",
+            )
+        if hand_data.get("target_object_id") is not None:
+            self._set_hand_field_state(
+                hand_data,
+                "target_object_id",
+                source="manual_create",
+                status="confirmed",
+            )
         if hand_data.get("anomaly_label") in (None, ""):
             hand_data["anomaly_label"] = self.extra_label_config.get("default_label", "Normal")
         self._sync_event_frames(new_event)
@@ -1325,10 +2802,40 @@ class HOIWindow(FrameControlMixin, QWidget):
         self._update_overlay(target)
 
     def _on_hoi_meta_changed(self):
+        self._sync_action_panel_selection()
         if not self.selected_hand_label:
             return
 
+        prev = dict(self.event_draft.get(self.selected_hand_label, {}) or {})
         self._save_ui_to_hand_draft(self.selected_hand_label)
+        hand_data = self.event_draft.get(self.selected_hand_label, {}) or {}
+        self._ensure_hand_annotation_state(hand_data)
+        for field_name, default_source in (
+            ("verb", "manual_ui"),
+            ("instrument_object_id", "manual_link"),
+            ("target_object_id", "manual_link"),
+        ):
+            old_value = prev.get(field_name)
+            new_value = hand_data.get(field_name)
+            if old_value == new_value:
+                continue
+            if field_name == "verb":
+                is_empty = not str(new_value or "").strip()
+            else:
+                is_empty = new_value is None
+            if is_empty:
+                self._clear_hand_field(
+                    hand_data,
+                    field_name,
+                    source=self._consume_pending_field_source(field_name, "manual_clear"),
+                )
+            else:
+                self._set_hand_field_state(
+                    hand_data,
+                    field_name,
+                    source=self._consume_pending_field_source(field_name, default_source),
+                    status="confirmed",
+                )
         if self.selected_event_id is not None:
             self._apply_draft_to_selected_event()
             self._refresh_events()
@@ -1341,6 +2848,9 @@ class HOIWindow(FrameControlMixin, QWidget):
         self.selected_event_id = None
         self.selected_hand_label = None
         self._reset_event_draft()
+        self._clear_videomae_action_runtime(clear_event_scores=True)
+        self._update_action_top5_display(None)
+        self._update_next_best_query_panel()
         if getattr(self, "hoi_timeline", None):
             self.hoi_timeline.set_selected(None, None)
             self._update_hoi_titles()
@@ -1400,14 +2910,61 @@ class HOIWindow(FrameControlMixin, QWidget):
             self._log("hoi_verb_rename", old=old, new=new)
 
     def _on_verb_selected(self, idx: int):
-        """[Modified] Clicking the list just syncs the combo for convenience, no auto-save."""
-        pass
+        if idx < 0 or idx >= len(self.verbs) or self._action_panel_sync:
+            return
+        self._sync_action_panel_selection(self.verbs[idx].name)
+
+    def _apply_verb_choice(self, verb_name: str, source: str = "manual"):
+        verb_name = str(verb_name or "").strip()
+        if not verb_name:
+            return
+        current = self.combo_verb.currentText().strip()
+        self._set_pending_field_source("verb", source)
+        if current != verb_name:
+            self.combo_verb.setCurrentText(verb_name)
+        else:
+            self._sync_action_panel_selection(verb_name)
+            self._on_hoi_meta_changed()
+        self._log(
+            "hoi_apply_verb_choice",
+            source=source,
+            verb=verb_name,
+            event_id=self.selected_event_id,
+            hand=self.selected_hand_label,
+        )
+
+    def _sync_action_panel_selection(self, verb_name: str = None):
+        if self._action_panel_sync:
+            return
+        verb_name = str(verb_name if verb_name is not None else self.combo_verb.currentText()).strip()
+        self._action_panel_sync = True
+        try:
+            if hasattr(self, "label_panel") and self.label_panel:
+                if verb_name and self.label_panel.index_of_label(verb_name) >= 0:
+                    self.label_panel.select_label_by_name(verb_name)
+                else:
+                    self.label_panel.clear_selection()
+        finally:
+            self._action_panel_sync = False
+
+    def _on_verb_library_item_clicked(self, item: QListWidgetItem):
+        if item is None:
+            return
+        verb_name = str(item.data(Qt.UserRole) or item.text() or "").strip()
+        if not verb_name or verb_name == "__OTHER_LABEL__":
+            return
+        self._apply_verb_choice(verb_name, source="verb_library")
 
     def _on_verb_double_clicked(self, item: QListWidgetItem):
-        """[New] Double-clicking the list updates the combo box (and triggers save)."""
-        verb_name = item.text()
+        self._on_verb_library_item_clicked(item)
 
-        self.combo_verb.setCurrentText(verb_name)
+    def _on_top5_item_clicked(self, item: QListWidgetItem):
+        if item is None:
+            return
+        verb_name = str(item.data(Qt.UserRole) or "").strip()
+        if not verb_name:
+            return
+        self._apply_verb_choice(verb_name, source="videomae_top5")
 
     def _renumber_verbs(self):
         """Ensure ids are monotonically increasing and new ids append after max."""
@@ -1639,6 +3196,15 @@ class HOIWindow(FrameControlMixin, QWidget):
         auto_events = {"frame_advanced"}
         if event in auto_events:
             return
+        fields.setdefault("assist_mode", self._experiment_mode_key())
+        fields.setdefault("selected_event_id", self.selected_event_id)
+        fields.setdefault("selected_hand", self.selected_hand_label or "")
+        try:
+            base = os.path.splitext(os.path.basename(self.video_path or ""))[0]
+        except Exception:
+            base = ""
+        if base:
+            fields.setdefault("video_id", base)
         if getattr(self, "op_logger", None):
             try:
                 frame = getattr(self.player, "current_frame", None)
@@ -1822,6 +3388,8 @@ class HOIWindow(FrameControlMixin, QWidget):
         Phase 1 Smart Loader (Corrected):
         Saves filtered YOLO boxes into self.raw_boxes to prevent overwriting.
         """
+        if not self._guard_experiment_mode("detection"):
+            return
         # --- 1. Dependency Check ---
         if not self.player.cap:
             QMessageBox.warning(
@@ -1907,6 +3475,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                                 "orig_frame": frame_idx,
                                 "label": self.class_map.get(cls_id, ""),
                                 "class_id": cls_id,
+                                "source": "yolo_import",
                                 "x1": x1,
                                 "y1": y1,
                                 "x2": x2,
@@ -2050,9 +3619,11 @@ class HOIWindow(FrameControlMixin, QWidget):
             QMessageBox.warning(self, "Error", f"Failed to load verbs:\n{ex}")
 
     def _load_yolo_model(self):
+        if not self._guard_experiment_mode("detection"):
+            return
         """Load Ultralytics YOLOv11 .pt weights for current-frame detection."""
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Load YOLO Model", "", "YOLO Weights (*.pt);;All Files (*)"
+            self, "Load YOLO Model", "", "Weight Files (*.pt *.pth);;All Files (*)"
         )
         if not fp:
             return
@@ -2074,66 +3645,333 @@ class HOIWindow(FrameControlMixin, QWidget):
             QMessageBox.warning(self, "Error", f"Failed to load model:\n{ex}")
 
     def _load_videomae_model(self):
+        if not self._guard_experiment_mode("semantic"):
+            return
         fp, _ = QFileDialog.getOpenFileName(
-            self, "Load VideoMAE Model", "", "Weight Files (*.pt *.bin *.safetensors);;All Files (*)"
+            self, "Load VideoMAE Model", "", "Weight Files (*.pt *.pth *.bin *.safetensors);;All Files (*)"
         )
         if not fp:
             return
         self.videomae_weights_path = fp
+        self._videomae_loaded_key = ""
+        self._clear_videomae_action_runtime(clear_event_scores=False)
         if self.videomae_verb_list_path:
             self._init_videomae()
         else:
             QMessageBox.information(self, "Info", "Model path stored. Please load a verb list to initialize.")
 
     def _load_videomae_verb_list(self):
+        if not self._guard_experiment_mode("semantic"):
+            return
         fp, _ = QFileDialog.getOpenFileName(
             self, "Load VideoMAE Verb List", "", "YAML/JSON Files (*.yaml *.json);;Text Files (*.txt);;All Files (*)"
         )
         if not fp:
             return
         self.videomae_verb_list_path = fp
+        self._videomae_loaded_key = ""
+        self._clear_videomae_action_runtime(clear_event_scores=False)
         if self.videomae_weights_path:
             self._init_videomae()
         else:
             QMessageBox.information(self, "Info", "Verb list stored. Please load model weights to initialize.")
 
-    def _init_videomae(self):
-        success, msg = self.videomae_handler.load_model(self.videomae_weights_path, self.videomae_verb_list_path)
-        if success:
-            QMessageBox.information(self, "Success", f"VideoMAE V2 initialized:\n{msg}")
-            self._log("hoi_load_videomae", weights=self.videomae_weights_path, verbs=self.videomae_verb_list_path)
-        else:
-            QMessageBox.warning(self, "Error", f"Failed to load VideoMAE V2:\n{msg}")
+    def _videomae_model_key(self) -> str:
+        weights = os.path.abspath(str(self.videomae_weights_path or "").strip())
+        verbs = os.path.abspath(str(self.videomae_verb_list_path or "").strip())
+        if not weights or not verbs:
+            return ""
+        return f"{weights}|{verbs}"
 
-    def _detect_selected_action_label(self):
-        if not self.selected_event_id:
-            QMessageBox.warning(self, "Warning", "Please select an action segment first.")
-            return
-        self._detect_action_label(self.selected_event_id, interactive=True)
+    def _videomae_ready(self) -> bool:
+        return bool(
+            self.video_path
+            and self.videomae_handler.model is not None
+            and self.videomae_handler.processor is not None
+            and self._videomae_loaded_key
+            and self._videomae_loaded_key == self._videomae_model_key()
+        )
 
-    def _detect_action_label(self, event_id, interactive=True):
-        event = self._find_event_by_id(event_id)
-        if not event: return
-        
+    def _clear_videomae_action_runtime(self, clear_event_scores: bool = False):
+        try:
+            self._videomae_auto_timer.stop()
+        except Exception:
+            pass
+        self._videomae_auto_event_id = None
+        self._videomae_auto_force_refresh = False
+        self._videomae_action_cache.clear()
+        self._videomae_event_signatures.clear()
+        if clear_event_scores:
+            for event in self.events:
+                if isinstance(event, dict):
+                    event.pop("videomae_top5", None)
+                    for actor in self.actors_config:
+                        hand_data = event.get("hoi_data", {}).get(actor["id"], {}) or {}
+                        self._ensure_hand_annotation_state(hand_data)
+                        suggestion = hand_data.get("_field_suggestions", {}).get("verb", {})
+                        source = str((suggestion or {}).get("source") or "").strip()
+                        if source.startswith("videomae"):
+                            clear_field_suggestion(hand_data, "verb")
+            for actor in self.actors_config:
+                draft = self.event_draft.get(actor["id"], {}) or {}
+                self._ensure_hand_annotation_state(draft)
+                suggestion = draft.get("_field_suggestions", {}).get("verb", {})
+                source = str((suggestion or {}).get("source") or "").strip()
+                if source.startswith("videomae"):
+                    clear_field_suggestion(draft, "verb")
+
+    def _normalize_videomae_candidates(self, candidates) -> List[dict]:
+        rows: List[dict] = []
+        for cand in list(candidates or []):
+            if not isinstance(cand, dict):
+                continue
+            label = str(cand.get("label") or "").strip()
+            if not label:
+                continue
+            score = cand.get("score")
+            try:
+                score = None if score is None else float(score)
+            except Exception:
+                score = None
+            rows.append({"label": label, "score": score})
+        return rows
+
+    def _videomae_signature_for_event(self, event: Optional[dict]) -> str:
+        if not event or not self._videomae_ready():
+            return ""
         start, end = self._compute_event_frames(event)
         if start is None or end is None:
-            if interactive:
-                QMessageBox.warning(self, "Warning", "Action segment must have start and end frames.")
-            return
+            return ""
+        payload = {
+            "video_path": os.path.abspath(str(self.video_path or "").strip()),
+            "start": int(start),
+            "end": int(end),
+            "model": self._videomae_loaded_key,
+        }
+        raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()
 
-        candidates, err = self.videomae_handler.predict(self.video_path, start, end)
-        if err:
-            if interactive:
-                QMessageBox.warning(self, "Detection Error", err)
+    def _cached_videomae_candidates(self, event_id: int, event: Optional[dict]):
+        signature = self._videomae_signature_for_event(event)
+        if not signature:
+            return [], ""
+        rows: List[dict] = []
+        if self._videomae_event_signatures.get(int(event_id)) == signature and event:
+            rows = self._normalize_videomae_candidates(event.get("videomae_top5"))
+        if not rows:
+            rows = self._normalize_videomae_candidates(
+                self._videomae_action_cache.get(signature)
+            )
+        return rows, signature
+
+    def _store_videomae_candidates(
+        self,
+        event_id: int,
+        event: Optional[dict],
+        signature: str,
+        candidates,
+    ) -> List[dict]:
+        clean = self._normalize_videomae_candidates(candidates)
+        stored = [dict(row) for row in clean]
+        if event is not None:
+            event["videomae_top5"] = [dict(row) for row in stored]
+        if signature and stored:
+            self._videomae_action_cache[signature] = [dict(row) for row in stored]
+            self._videomae_event_signatures[int(event_id)] = signature
+        return stored
+
+    def _invalidate_videomae_candidates(self, event_id: Optional[int]) -> None:
+        if event_id is None:
             return
+        try:
+            key = int(event_id)
+        except Exception:
+            return
+        self._videomae_event_signatures.pop(key, None)
+
+    def _queue_action_label_refresh(
+        self,
+        event_id: Optional[int] = None,
+        delay_ms: Optional[int] = None,
+        force: bool = False,
+    ) -> None:
+        if not self._semantic_assist_enabled():
+            return
+        if event_id is None:
+            event_id = self.selected_event_id
+        if event_id is None:
+            return
+        try:
+            event_id = int(event_id)
+        except Exception:
+            return
+        event = self._find_event_by_id(event_id)
+        if not event:
+            return
+        if not self._videomae_ready():
+            if self.selected_event_id == event_id:
+                self._update_action_top5_display(event_id)
+            return
+        if not force:
+            cached, _signature = self._cached_videomae_candidates(event_id, event)
+            if cached:
+                if self.selected_event_id == event_id:
+                    self._update_action_top5_display(event_id)
+                return
+        self._videomae_auto_event_id = event_id
+        self._videomae_auto_force_refresh = bool(force)
+        wait_ms = self._videomae_auto_timer.interval() if delay_ms is None else max(0, int(delay_ms))
+        self._videomae_auto_timer.start(wait_ms)
+
+    def _run_pending_action_label_refresh(self) -> None:
+        event_id = self._videomae_auto_event_id
+        force = bool(self._videomae_auto_force_refresh)
+        self._videomae_auto_event_id = None
+        self._videomae_auto_force_refresh = False
+        if event_id is None or self.selected_event_id != event_id:
+            return
+        self._detect_action_label(
+            event_id,
+            interactive=False,
+            auto_apply=False,
+            use_cache=not force,
+            force=force,
+            report_errors=False,
+        )
+
+    def _init_videomae(self):
+        self._clear_videomae_action_runtime(clear_event_scores=False)
+        success, msg = self.videomae_handler.load_model(
+            self.videomae_weights_path, self.videomae_verb_list_path
+        )
+        if success:
+            self._videomae_loaded_key = self._videomae_model_key()
+            self._sync_label_panel_with_videomae()
+            QMessageBox.information(self, "Success", f"VideoMAE V2 initialized and verb list synchronized.\n{msg}")
+            self._log(
+                "hoi_load_videomae",
+                weights=self.videomae_weights_path,
+                verbs=self.videomae_verb_list_path,
+            )
+            if self.selected_event_id is not None:
+                self._queue_action_label_refresh(self.selected_event_id, delay_ms=120)
+        else:
+            self._videomae_loaded_key = ""
+            QMessageBox.warning(self, "Error", f"Failed to load VideoMAE V2:\n{msg}")
+
+    def _sync_label_panel_with_videomae(self):
+        if not self.videomae_handler or not self.videomae_handler.labels:
+            return
+        
+        # Cross-reference labels and add missing ones to self.verbs
+        existing_names = {v.name.lower().strip() for v in self.verbs}
+        max_id = max([v.id for v in self.verbs], default=-1)
+        added_count = 0
+        
+        for name in self.videomae_handler.labels:
+            clean_name = str(name).strip()
+            if not clean_name or clean_name.lower() in existing_names:
+                continue
+            
+            max_id += 1
+            self.verbs.append(LabelDef(name=clean_name, id=max_id, color_name="Auto"))
+            existing_names.add(clean_name.lower())
+            added_count += 1
+            
+        if added_count > 0:
+            self._renumber_verbs()
+            self._update_verb_combo()
+            self.label_panel.refresh()
+
+    def _detect_selected_action_label(self):
+        if not self._guard_experiment_mode("semantic"):
+            return
+        if self.selected_event_id is None:
+            QMessageBox.warning(self, "Warning", "Please select an action segment first.")
+            return
+        self._detect_action_label(
+            self.selected_event_id,
+            interactive=True,
+            auto_apply=True,
+            use_cache=True,
+            force=False,
+            report_errors=True,
+        )
+
+    def _refresh_selected_action_label(self):
+        if not self._guard_experiment_mode("semantic"):
+            return
+        if self.selected_event_id is None:
+            QMessageBox.warning(self, "Warning", "Please select an action segment first.")
+            return
+        self._detect_action_label(
+            self.selected_event_id,
+            interactive=False,
+            auto_apply=False,
+            use_cache=False,
+            force=True,
+            report_errors=True,
+        )
+
+    def _detect_action_label(
+        self,
+        event_id,
+        interactive=True,
+        auto_apply=True,
+        use_cache=True,
+        force=False,
+        report_errors=False,
+    ):
+        notify_user = bool(interactive or report_errors)
+        event = self._find_event_by_id(event_id)
+        if not event:
+            if notify_user:
+                QMessageBox.warning(self, "Warning", "Please select an action segment first.")
+            return False
+
+        start, end = self._compute_event_frames(event)
+        if start is None or end is None:
+            if notify_user:
+                QMessageBox.warning(
+                    self,
+                    "Warning",
+                    "Action segment must have start and end frames.",
+                )
+            return False
+
+        signature = self._videomae_signature_for_event(event)
+        candidates: List[dict] = []
+        if use_cache and not force:
+            candidates, signature = self._cached_videomae_candidates(event_id, event)
 
         if not candidates:
-            if interactive:
-                QMessageBox.information(self, "Info", "No labels predicted.")
-            return
-
-        # NEW: Store top5 results in event
-        event["videomae_top5"] = candidates
+            if not self._videomae_ready():
+                if notify_user:
+                    QMessageBox.warning(
+                        self,
+                        "Detection Error",
+                        "Load a matching VideoMAE model and verb list first.",
+                    )
+                return False
+            raw_candidates, err = self.videomae_handler.predict(
+                self.video_path, start, end
+            )
+            if err:
+                if notify_user:
+                    QMessageBox.warning(self, "Detection Error", err)
+                return False
+            candidates = self._normalize_videomae_candidates(raw_candidates)
+            if not candidates:
+                if notify_user:
+                    QMessageBox.information(self, "Info", "No labels predicted.")
+                return False
+            if not signature:
+                signature = self._videomae_signature_for_event(event)
+        candidates = self._store_videomae_candidates(
+            int(event_id), event, signature, candidates
+        )
+        self._sync_event_videomae_suggestions(int(event_id), event, candidates)
+        self._update_action_top5_display(event_id)
 
         selected = None
         if interactive:
@@ -2141,60 +3979,133 @@ class HOIWindow(FrameControlMixin, QWidget):
             if dlg.exec_() == QDialog.Accepted:
                 selected = dlg.get_selected_label()
             else:
-                # Default to top rank if canceled as per user request
-                selected = candidates[0]['label']
-            # Update display immediately if interactive
-            self._update_action_top5_display(event_id)
-        else:
-            selected = candidates[0]['label']
-            
+                return True
+        elif auto_apply and candidates:
+            selected = candidates[0]["label"]
+
         if selected:
-            # Find the verb id in self.verbs
             verb_id = -1
             for v in self.verbs:
                 if v.name.lower() == selected.lower():
                     verb_id = v.id
                     break
-            
+
             if verb_id != -1:
+                if not interactive:
+                    has_locked_confirmed = False
+                    for hand in self.actors_config:
+                        hid = hand["id"]
+                        hand_data = event.get("hoi_data", {}).get(hid, {}) or {}
+                        state = get_field_state(hand_data, "verb")
+                        current_value = str(hand_data.get("verb") or "").strip()
+                        if (
+                            state.get("status") == "confirmed"
+                            and current_value
+                            and current_value != selected
+                        ):
+                            has_locked_confirmed = True
+                            break
+                    if has_locked_confirmed:
+                        self._log(
+                            "hoi_skip_locked_verb_autofill",
+                            event_id=event_id,
+                            suggested=selected,
+                        )
+                        return True
                 event["verb_id"] = verb_id
-                # Update hoi_data verb for consistency if needed (optional but good)
+                source_name = (
+                    "videomae_selected" if interactive else "videomae_top1_auto"
+                )
+                target_status = "confirmed" if interactive else "suggested"
                 for hand in self.actors_config:
                     hid = hand["id"]
                     if hid in event.get("hoi_data", {}):
                         event["hoi_data"][hid]["verb"] = selected
-                
+                        self._set_hand_field_state(
+                            event["hoi_data"][hid],
+                            "verb",
+                            source=source_name,
+                            status=target_status,
+                        )
+                    if hid in self.event_draft:
+                        self.event_draft[hid]["verb"] = selected
+                        self._set_hand_field_state(
+                            self.event_draft[hid],
+                            "verb",
+                            source=source_name,
+                            status=target_status,
+                        )
+
                 self._refresh_events()
                 if hasattr(self, "hoi_timeline") and self.hoi_timeline:
                     self.hoi_timeline.refresh()
-            elif interactive:
-                 QMessageBox.warning(self, "Error", f"Verb '{selected}' not found in the current project verb list.")
+                if self.selected_event_id == event_id:
+                    if self.selected_hand_label:
+                        self._load_hand_draft_to_ui(self.selected_hand_label)
+                    else:
+                        self._sync_action_panel_selection(selected)
+            elif notify_user:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"Verb '{selected}' not found in the current project verb list.",
+                )
+        return True
 
     def _update_action_top5_display(self, event_id):
-        if not hasattr(self, "list_top5") or not self.list_top5:
+        if not hasattr(self, "label_panel") or not self.label_panel:
             return
-        
-        self.list_top5.clear()
+        if not self._semantic_assist_enabled():
+            self.label_panel.clear_candidate_priority()
+            self._sync_action_panel_selection()
+            self._update_next_best_query_panel()
+            return
+
         if event_id is None:
-            self.list_top5.setEnabled(False)
+            self.label_panel.clear_candidate_priority()
+            self._sync_action_panel_selection()
+            self._update_next_best_query_panel()
             return
-            
+
         event = self._find_event_by_id(event_id)
-        if not event or "videomae_top5" not in event:
-            self.list_top5.setEnabled(False)
+        candidates, _signature = self._cached_videomae_candidates(int(event_id), event)
+        if not event or not candidates:
+            self.label_panel.clear_candidate_priority()
+            self._sync_action_panel_selection()
+            self._update_next_best_query_panel()
             return
-        
-        self.list_top5.setEnabled(True)
-        candidates = event["videomae_top5"]
-        for cand in candidates:
-            item_text = f"{cand['label']} ({cand['score']:.2%})"
-            self.list_top5.addItem(item_text)
+
+        raw_candidates = [
+            (cand.get("label"), cand.get("score"))
+            for cand in candidates
+            if cand.get("label")
+        ]
+        visible_candidates = [
+            (name, score)
+            for name, score in raw_candidates
+            if self.label_panel.index_of_label(name) >= 0
+        ]
+        if visible_candidates:
+            self.label_panel.set_candidate_priority(visible_candidates)
+        else:
+            self.label_panel.clear_candidate_priority()
+        self._sync_action_panel_selection()
+        self._update_next_best_query_panel()
 
     def _detect_all_action_labels(self):
+        if not self._guard_experiment_mode("semantic"):
+            return
         if not self.events:
             QMessageBox.information(self, "Info", "No actions to detect.")
             return
-            
+        if not self._videomae_ready():
+            QMessageBox.information(
+                self,
+                "Info",
+                "Load a VideoMAE model and verb list before batch action labeling.",
+            )
+            return
+
         progress = QProgressDialog("Detecting all action labels...", "Cancel", 0, len(self.events), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
@@ -2204,7 +4115,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                 break
             progress.setValue(i)
             QApplication.processEvents()
-            self._detect_action_label(event["event_id"], interactive=False)
+            self._detect_action_label(event["event_id"], interactive=False, auto_apply=True)
         
         progress.setValue(len(self.events))
         QMessageBox.information(self, "Finished", "Batch action detection complete.")
@@ -2398,6 +4309,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                     "orig_frame": frame_idx - self.start_offset,
                     "label": str(class_name),
                     "class_id": cls_id,
+                    "source": "yolo_detect",
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -2573,6 +4485,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                     "id": self.box_id_counter,
                     "orig_frame": frame_idx - self.start_offset,
                     "label": label,
+                    "source": "mediapipe_hands",
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -2587,6 +4500,8 @@ class HOIWindow(FrameControlMixin, QWidget):
         return len(boxes)
 
     def _detect_selected_action(self):
+        if not self._guard_experiment_mode("detection"):
+            return
         if self.selected_event_id is None:
             QMessageBox.information(
                 self,
@@ -2679,6 +4594,8 @@ class HOIWindow(FrameControlMixin, QWidget):
         )
 
     def _detect_all_actions(self):
+        if not self._guard_experiment_mode("detection"):
+            return
         if not self.events:
             QMessageBox.information(self, "HOI Detection", "No actions are available.")
             return
@@ -2751,6 +4668,8 @@ class HOIWindow(FrameControlMixin, QWidget):
 
     def _incremental_train_yolo(self):
         """Main entry point for YOLO fine-tuning on current annotations."""
+        if not self._guard_experiment_mode("detection"):
+            return
         if not self.yolo_weights_path or not self.video_path:
             QMessageBox.warning(self, "Error", "Please load both a video and a YOLO model first.")
             return
@@ -2903,6 +4822,8 @@ class HOIWindow(FrameControlMixin, QWidget):
 
     def _detect_current_frame_combined(self):
         """Run YOLO object detection and MediaPipe hand detection on the current frame."""
+        if not self._guard_experiment_mode("detection"):
+            return
         if not self.player.cap:
             QMessageBox.warning(self, "Missing prerequisite", "Please load a video first.")
             return
@@ -2996,10 +4917,43 @@ class HOIWindow(FrameControlMixin, QWidget):
 
             # 4. Build payload
             payload = self._build_payload_v2()
+            self._refresh_sparse_evidence_snapshots()
 
             # 5. Write file
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
+
+            try:
+                graph = build_hoi_event_graph(
+                    self.events,
+                    video_path=self.video_path,
+                    annotation_path=fp,
+                    actors_config=self.actors_config,
+                )
+                graph_path = save_event_graph_sidecar(fp, graph)
+                self._log(
+                    "hoi_save_event_graph",
+                    path=graph_path,
+                    anchors=len(graph.get("onset_anchors", []) or []),
+                    locked_regions=len(graph.get("locked_regions", []) or []),
+                    consistency_issues=len(graph.get("consistency_flags", []) or []),
+                    sparse_evidence_expected=(
+                        (graph.get("stats", {}) or {}).get(
+                            "sparse_evidence_expected_count", 0
+                        )
+                    ),
+                    sparse_evidence_missing=(
+                        (graph.get("stats", {}) or {}).get(
+                            "sparse_evidence_missing_count", 0
+                        )
+                    ),
+                )
+            except Exception as graph_ex:
+                self._log(
+                    "hoi_save_event_graph_failed",
+                    path=fp,
+                    error=str(graph_ex),
+                )
 
             self._log(
                 "hoi_save_annotations",
@@ -3076,7 +5030,29 @@ class HOIWindow(FrameControlMixin, QWidget):
                 if not allow_missing_bbox:
                     bbox_errors = self._validate_integrity(h_data)
                     if bbox_errors:
-                        missing.append("bbox")
+                        time_priority = {"onset": 0, "start": 1, "end": 2}
+                        bbox_errors = sorted(
+                            bbox_errors,
+                            key=lambda err: (
+                                time_priority.get(
+                                    str(err.get("time_key") or "").strip().lower(), 3
+                                ),
+                                str(err.get("role_key") or "").strip().lower(),
+                            ),
+                        )
+                        preview_slots = []
+                        for err in bbox_errors[:2]:
+                            role_key = str(err.get("role_key") or "").strip().lower()
+                            time_key = str(err.get("time_key") or "").strip().lower()
+                            if role_key and time_key:
+                                preview_slots.append(f"{role_key}@{time_key}")
+                        if preview_slots:
+                            label = "bbox " + ", ".join(preview_slots)
+                            if len(bbox_errors) > len(preview_slots):
+                                label += f" (+{len(bbox_errors) - len(preview_slots)})"
+                            missing.append(label)
+                        else:
+                            missing.append(f"bbox ({len(bbox_errors)})")
                 if missing:
                     frame = (
                         onset
@@ -3133,9 +5109,22 @@ class HOIWindow(FrameControlMixin, QWidget):
         if not issues:
             self.lbl_incomplete.setText("Incomplete: none")
             self.lbl_incomplete.setToolTip("No incomplete HandOI segments detected.")
+            self._set_status_chip(getattr(self, "lbl_incomplete_chip", None), "Incomplete 0", "ok")
+            if getattr(self, "lbl_review_status", None):
+                self.lbl_review_status.setText("No incomplete HandOI segments detected.")
+                self.lbl_review_status.setToolTip("No incomplete HandOI segments detected.")
+            self._set_status_card_tone(
+                getattr(self, "review_status_card", None),
+                "active" if bool(getattr(self, "validation_enabled", False)) else "ok",
+            )
             self.btn_incomplete_prev.setEnabled(False)
             self.btn_incomplete_next.setEnabled(False)
+            if getattr(self, "btn_review_prev", None):
+                self.btn_review_prev.setEnabled(False)
+            if getattr(self, "btn_review_next", None):
+                self.btn_review_next.setEnabled(False)
             self._incomplete_idx = -1
+            self._update_inspector_tab_labels()
             return
         self._incomplete_idx = min(
             self._incomplete_idx if self._incomplete_idx >= 0 else 0, len(issues) - 1
@@ -3148,9 +5137,20 @@ class HOIWindow(FrameControlMixin, QWidget):
             tooltip.append(f"Event {entry['event_id']} {hand}: {missing}")
         if len(issues) > 6:
             tooltip.append("...")
-        self.lbl_incomplete.setToolTip("\n".join(tooltip))
+        tooltip_text = "\n".join(tooltip)
+        self.lbl_incomplete.setToolTip(tooltip_text)
+        self._set_status_chip(getattr(self, "lbl_incomplete_chip", None), f"Incomplete {len(issues)}", "warn")
+        if getattr(self, "lbl_review_status", None):
+            self.lbl_review_status.setText(tooltip_text)
+            self.lbl_review_status.setToolTip(tooltip_text)
+        self._set_status_card_tone(getattr(self, "review_status_card", None), "warn")
         self.btn_incomplete_prev.setEnabled(True)
         self.btn_incomplete_next.setEnabled(True)
+        if getattr(self, "btn_review_prev", None):
+            self.btn_review_prev.setEnabled(True)
+        if getattr(self, "btn_review_next", None):
+            self.btn_review_next.setEnabled(True)
+        self._update_inspector_tab_labels()
 
     def _jump_incomplete(self, direction: int):
         if not self._incomplete_issues:
@@ -3170,6 +5170,7 @@ class HOIWindow(FrameControlMixin, QWidget):
         hand = issue.get("hand")
         if event_id is not None and self._is_hand_label(hand):
             self._set_selected_event(event_id, hand)
+        self._focus_inspector_tab("review")
         if getattr(self, "hoi_timeline", None):
             self.hoi_timeline.set_current_frame(frame)
             self.hoi_timeline.refresh()
@@ -3756,6 +5757,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                     "id": bid,
                     "orig_frame": f_idx - self.start_offset,
                     "label": label,
+                    "source": "loaded_annotation",
                     "x1": x1,
                     "y1": y1,
                     "x2": x2,
@@ -3782,6 +5784,7 @@ class HOIWindow(FrameControlMixin, QWidget):
             tool_tid = links.get("tool_track_id")
             target_id = track_obj_id.get(target_tid) if target_tid else None
             tool_id = track_obj_id.get(tool_tid) if tool_tid else None
+            annotation_state = event.get("annotation_state", {}) or {}
 
             def _safe_int(val, fallback):
                 try:
@@ -3812,7 +5815,8 @@ class HOIWindow(FrameControlMixin, QWidget):
                     break
 
             if hand_key:
-                hoi_data[hand_key] = {
+                hoi_data[hand_key] = self._ensure_hand_annotation_state(
+                    {
                     "verb": verb,
                     "instrument_object_id": tool_id,
                     "target_object_id": target_id,
@@ -3820,7 +5824,13 @@ class HOIWindow(FrameControlMixin, QWidget):
                     "functional_contact_onset": o,
                     "interaction_end": e,
                     "anomaly_label": anomaly,
-                }
+                    "_field_state": annotation_state.get("field_state", {}),
+                    "_field_suggestions": annotation_state.get("field_suggestions", {}),
+                    "_sparse_evidence_state": annotation_state.get(
+                        "sparse_evidence_state", {}
+                    ),
+                    }
+                )
             return {
                 "event_id": self.event_id_counter,
                 "frames": [start, end],
@@ -3832,6 +5842,16 @@ class HOIWindow(FrameControlMixin, QWidget):
             for event in events.get(side_key, []) or []:
                 self.events.append(_event_to_entry(side_key, event))
                 self.event_id_counter += 1
+
+        for event in self.events:
+            hoi_data = event.get("hoi_data", {}) or {}
+            for actor in self.actors_config:
+                hand_key = actor["id"]
+                if hand_key in hoi_data and isinstance(hoi_data[hand_key], dict):
+                    self._hydrate_hand_annotation_state(
+                        hoi_data[hand_key], default_source="loaded_annotation"
+                    )
+                    self._compute_sparse_evidence_state(hoi_data[hand_key])
 
         self._ensure_verbs_cover_events()
         self._refresh_events()
@@ -4104,6 +6124,7 @@ class HOIWindow(FrameControlMixin, QWidget):
     def _build_payload_v2(self) -> dict:
         """[Fix] Build payload with STRICT filtering for empty hands."""
 
+        self._refresh_sparse_evidence_snapshots()
         self.events.sort(key=lambda x: x.get("frames", [0, 0])[0])
 
         base = os.path.splitext(os.path.basename(self.video_path or "annotation"))[0]
@@ -4161,6 +6182,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                 hand_key = actor["id"]
                 side_key = hand_key.lower()
                 h_data = event.get("hoi_data", {}).get(hand_key, {})
+                self._ensure_hand_annotation_state(h_data)
 
                 verb = h_data.get("verb", "")
                 target = h_data.get("target_object_id")
@@ -4199,6 +6221,17 @@ class HOIWindow(FrameControlMixin, QWidget):
                     "contact_onset_frame": final_onset,
                     "end_frame": final_end,
                     "anomaly_label": anom,
+                    "annotation_state": {
+                        "field_state": copy.deepcopy(
+                            h_data.get("_field_state", {}) or {}
+                        ),
+                        "field_suggestions": copy.deepcopy(
+                            h_data.get("_field_suggestions", {}) or {}
+                        ),
+                        "sparse_evidence_state": copy.deepcopy(
+                            h_data.get("_sparse_evidence_state", {}) or {}
+                        ),
+                    },
                 }
 
                 if has_verb:
@@ -4421,6 +6454,8 @@ class HOIWindow(FrameControlMixin, QWidget):
                     auto_label_fetcher=None,
                 )
 
+        self._update_inspector_tab_labels()
+
         if not skip_events:
             self._refresh_events(refresh_boxes=False)
 
@@ -4443,12 +6478,14 @@ class HOIWindow(FrameControlMixin, QWidget):
     def _refresh_events(self, refresh_boxes: bool = True):
         """[Step 3 Fix] Refresh list: show detailed info including Instrument for error checking."""
         frame = self.player.current_frame
+        self._refresh_sparse_evidence_snapshots()
         for ev in self.events:
             self._sync_event_frames(ev)
         self._update_overlay(frame)
         if refresh_boxes and self.validation_enabled:
             self._refresh_boxes_for_frame(frame, skip_events=True)
         self._update_incomplete_indicator()
+        self._update_next_best_query_panel()
         if getattr(self, "hoi_timeline", None):
             self.hoi_timeline.refresh()
 
@@ -4667,6 +6704,9 @@ class HOIWindow(FrameControlMixin, QWidget):
         ):
             if widget is not None:
                 widget.setEnabled(bool(on))
+        if not on and getattr(self, "rad_draw_none", None) is not None:
+            self.rad_draw_none.setChecked(True)
+        self._update_draw_mode_visibility()
         self._refresh_boxes_for_frame(self.player.current_frame)
         self._log("hoi_edit_boxes_toggle", on=bool(on))
 
@@ -4676,11 +6716,17 @@ class HOIWindow(FrameControlMixin, QWidget):
                 self.lbl_validation.setStyleSheet("color: #12b76a; font-weight: 600;")
             else:
                 self.lbl_validation.setStyleSheet("")
+        self._set_status_chip(
+            getattr(self, "lbl_validation_chip", None),
+            "Validation On" if on else "Validation Off",
+            "ok" if on else "neutral",
+        )
         if getattr(self, "btn_validation", None):
             if on:
                 self.btn_validation.setToolTip("Return to annotation mode")
             else:
                 self.btn_validation.setToolTip("Toggle validation on/off")
+        self._update_incomplete_indicator()
 
     def _on_validation_toggled(self, on: bool):
         if on:
@@ -4716,6 +6762,90 @@ class HOIWindow(FrameControlMixin, QWidget):
             return
         if callable(self._on_switch_task):
             self._on_switch_task(text)
+
+    def _experiment_mode_key(self) -> str:
+        combo = getattr(self, "combo_experiment_mode", None)
+        if combo is not None:
+            return str(combo.currentData() or getattr(self, "_experiment_mode", "full_assist"))
+        return str(getattr(self, "_experiment_mode", "full_assist") or "full_assist")
+
+    def _detection_assist_enabled(self) -> bool:
+        return self._experiment_mode_key() in ("assist", "full_assist")
+
+    def _semantic_assist_enabled(self) -> bool:
+        return self._experiment_mode_key() == "full_assist"
+
+    def _guard_experiment_mode(self, feature: str) -> bool:
+        if feature == "detection" and self._detection_assist_enabled():
+            return True
+        if feature == "semantic" and self._semantic_assist_enabled():
+            return True
+        if feature == "semantic":
+            QMessageBox.information(
+                self,
+                "Experiment Mode",
+                "Switch to Full Assist to use VideoMAE-based action-label assistance.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Experiment Mode",
+                "Switch to Assist or Full Assist to use imported or detected assistance.",
+            )
+        return False
+
+    def _apply_experiment_mode_ui(self) -> None:
+        mode = self._experiment_mode_key()
+        self._experiment_mode = mode
+        detection_enabled = self._detection_assist_enabled()
+        semantic_enabled = self._semantic_assist_enabled()
+
+        for obj in (
+            getattr(self, "act_import_yolo_boxes", None),
+            getattr(self, "act_load_yolo_model", None),
+            getattr(self, "act_detect_current_frame", None),
+            getattr(self, "act_detect_selected_action", None),
+            getattr(self, "act_detect_all_actions", None),
+            getattr(self, "act_load_hands_xml", None),
+            getattr(self, "act_incremental_train_yolo", None),
+            getattr(self, "act_swap_hands", None),
+            getattr(self, "btn_detect", None),
+            getattr(self, "btn_detect_action", None),
+            getattr(self, "btn_object_tools", None),
+        ):
+            if obj is not None:
+                obj.setEnabled(detection_enabled)
+
+        for obj in (
+            getattr(self, "act_load_videomae_model", None),
+            getattr(self, "act_load_videomae_verb_list", None),
+            getattr(self, "act_review_selected_action_label", None),
+            getattr(self, "act_auto_apply_action_labels", None),
+            getattr(self, "act_batch_apply_action_labels", None),
+            getattr(self, "btn_suggest_action_label", None),
+        ):
+            if obj is not None:
+                obj.setEnabled(semantic_enabled)
+
+        if getattr(self, "btn_suggest_action_label", None) is not None:
+            self.btn_suggest_action_label.setVisible(semantic_enabled)
+        if getattr(self, "act_batch_apply_action_labels", None) is not None:
+            self.act_batch_apply_action_labels.setVisible(semantic_enabled)
+
+        if not semantic_enabled:
+            try:
+                self._videomae_auto_timer.stop()
+            except Exception:
+                pass
+            self._update_action_top5_display(None)
+        else:
+            self._update_action_top5_display(self.selected_event_id)
+            if self.selected_event_id is not None:
+                self._queue_action_label_refresh(self.selected_event_id, delay_ms=120)
+
+    def _on_experiment_mode_changed(self, _index: int) -> None:
+        self._apply_experiment_mode_ui()
+        self._log("hoi_experiment_mode_changed", mode=self._experiment_mode_key())
 
     def _hoi_state_signature(self) -> str:
         payload = {
@@ -4789,12 +6919,33 @@ class HOIWindow(FrameControlMixin, QWidget):
 
         if hand_data["instrument_object_id"] is None:
             hand_data["instrument_object_id"] = obj_id
+            self._set_hand_field_state(
+                hand_data,
+                "instrument_object_id",
+                source="object_pick",
+                status="confirmed",
+            )
         elif hand_data["target_object_id"] is None:
             if obj_id == hand_data["instrument_object_id"]:
                 hand_data["instrument_object_id"] = None
+                self._clear_hand_field(
+                    hand_data, "instrument_object_id", source="object_pick_reassign"
+                )
                 hand_data["target_object_id"] = obj_id
+                self._set_hand_field_state(
+                    hand_data,
+                    "target_object_id",
+                    source="object_pick",
+                    status="confirmed",
+                )
             else:
                 hand_data["target_object_id"] = obj_id
+                self._set_hand_field_state(
+                    hand_data,
+                    "target_object_id",
+                    source="object_pick",
+                    status="confirmed",
+                )
 
         self._load_hand_draft_to_ui(self.selected_hand_label)
         self._update_overlay(self.player.current_frame)
@@ -4939,6 +7090,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                 "id": obj_id,
                 "orig_frame": target_orig,
                 "label": label_txt,
+                "source": "manual_box_add",
                 "x1": new_box.get("x1"),
                 "y1": new_box.get("y1"),
                 "x2": new_box.get("x2"),
@@ -4977,6 +7129,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                     rb["label"] = label_txt
                 if new_class_id is not None:
                     rb["class_id"] = new_class_id
+                rb["source"] = "manual_box_edit"
                 changed = True
         if changed:
             self._rebuild_bboxes_from_raw()
@@ -5162,6 +7315,8 @@ class HOIWindow(FrameControlMixin, QWidget):
 
     def _load_hands_xml(self):
         """[Fix] Load hand bbox XML with Auto-Alignment for clipped videos."""
+        if not self._guard_experiment_mode("detection"):
+            return
         fp, _ = QFileDialog.getOpenFileName(
             self, "Load hand bbox XML", "", "XML Files (*.xml);;All Files (*)"
         )
@@ -5312,6 +7467,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                                 "id": self.box_id_counter,
                                 "orig_frame": frame,
                                 "label": label,
+                                "source": "hands_xml",
                                 "x1": float(box.attrib.get("xtl")),
                                 "y1": float(box.attrib.get("ytl")),
                                 "x2": float(box.attrib.get("xbr")),
@@ -5345,6 +7501,7 @@ class HOIWindow(FrameControlMixin, QWidget):
                                 "id": self.box_id_counter,
                                 "orig_frame": int(box.attrib.get("frame")),
                                 "label": label,
+                                "source": "hands_xml",
                                 "x1": float(box.attrib.get("xtl")),
                                 "y1": float(box.attrib.get("ytl")),
                                 "x2": float(box.attrib.get("xbr")),
@@ -5390,18 +7547,33 @@ class HOIWindow(FrameControlMixin, QWidget):
                     name = self._object_name_for_id(
                         uid, default_for_none="", fallback=""
                     )
+                    role_key = str(role or "").strip().lower()
+                    time_key = str(time_label or "").strip().lower()
 
                     errors.append(
                         {
                             "msg": f"Frame {frame} ({time_label}) missing {role}: [{uid}] {name}",
                             "frame": frame,
+                            "role": role,
+                            "role_key": role_key,
+                            "time_label": time_label,
+                            "time_key": time_key,
+                            "object_id": uid,
+                            "object_name": name,
+                            "slot": f"{role_key}_{time_key}",
                         }
                     )
         return errors
 
     def _add_anomaly_item(self, name: str, checked: bool = False):
         item = QListWidgetItem(name)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item.setFlags(
+            item.flags()
+            | Qt.ItemIsUserCheckable
+            | Qt.ItemIsEnabled
+            | Qt.ItemIsEditable
+        )
+        item.setData(Qt.UserRole, name)
         item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self.anomaly_list.addItem(item)
 
@@ -5486,6 +7658,21 @@ class HOIWindow(FrameControlMixin, QWidget):
         if self._anomaly_block:
             return
 
+        old_text = (item.data(Qt.UserRole) or "").strip()
+        curr_text = item.text().strip()
+        if old_text and curr_text != old_text:
+            if not curr_text:
+                self._revert_anomaly_item_text(item, old_text)
+                return
+            existing = self._find_anomaly_item(curr_text)
+            if existing and existing is not item:
+                QMessageBox.information(self, "Info", f"Label '{curr_text}' already exists.")
+                self._revert_anomaly_item_text(item, old_text)
+                return
+            self._rename_anomaly_item_logic(old_text, curr_text)
+            self._log("hoi_anomaly_label_rename", old=old_text, new=curr_text)
+            return
+
         self._anomaly_block = True
         try:
             is_checked = item.checkState() == Qt.Checked
@@ -5521,6 +7708,38 @@ class HOIWindow(FrameControlMixin, QWidget):
                     if getattr(self, "hoi_timeline", None):
                         self.hoi_timeline.refresh()
 
+        finally:
+            self._anomaly_block = False
+
+    def _on_anomaly_title_edited(self, new_title: str):
+        new_title = (new_title or "").strip()
+        old_title = self.extra_label_config.get("title", "")
+        if not new_title or new_title == old_title:
+            self.group_anomaly.setTitle(old_title)
+            return
+
+        old_fallback = self.extra_label_config.get("default_label", "Normal")
+        self.extra_label_config["title"] = new_title
+        self.group_anomaly.setTitle(new_title)
+
+        if old_title == "Hand Anomaly Label" and old_fallback == "Normal":
+            self._rename_anomaly_item_logic("Normal", "Default")
+            self.extra_label_config["default_label"] = "Default"
+            self._apply_extra_label_config()
+
+        self._log("hoi_anomaly_module_rename", title=new_title)
+
+    def _on_anomaly_item_double_clicked(self, item: QListWidgetItem):
+        if item is None:
+            return
+        self.anomaly_list.setCurrentItem(item)
+        self.anomaly_list.editItem(item)
+
+    def _revert_anomaly_item_text(self, item: QListWidgetItem, text: str):
+        self._anomaly_block = True
+        try:
+            item.setText(text)
+            item.setData(Qt.UserRole, text)
         finally:
             self._anomaly_block = False
 
@@ -5594,6 +7813,16 @@ class HOIWindow(FrameControlMixin, QWidget):
         
         # Refresh UI
         self._apply_extra_label_config()
+        if self.selected_hand_label and self.selected_hand_label in self.event_draft:
+            current_labels = self.event_draft[self.selected_hand_label].get(
+                "anomaly_label", ""
+            )
+            self._set_selected_anomaly_label(current_labels)
+            self._update_status_label()
+        if self.selected_event_id is not None:
+            self._refresh_events()
+            if getattr(self, "hoi_timeline", None):
+                self.hoi_timeline.refresh()
 
     def _rename_anomaly_label(self):
         # ClickToggleList is in NoSelection mode; use currentItem or first checked item
@@ -6061,6 +8290,7 @@ class HOIWindow(FrameControlMixin, QWidget):
         anomaly = self._selected_anomaly_label()
 
         hand_data = self.event_draft[hand_label]
+        self._ensure_hand_annotation_state(hand_data)
         hand_data["verb"] = verb
         hand_data["instrument_object_id"] = inst_id
         hand_data["target_object_id"] = target_id
@@ -6192,6 +8422,7 @@ class HOIWindow(FrameControlMixin, QWidget):
             return
 
         hand_data = self.event_draft[hand_label]
+        self._ensure_hand_annotation_state(hand_data)
 
         self.combo_verb.blockSignals(True)
         self.combo_instrument.blockSignals(True)
@@ -6225,6 +8456,7 @@ class HOIWindow(FrameControlMixin, QWidget):
             self.combo_instrument.blockSignals(False)
             self.combo_target.blockSignals(False)
 
+        self._sync_action_panel_selection(hand_data.get("verb", ""))
         anomaly = hand_data.get("anomaly_label", self.extra_label_config.get("default_label", "Normal"))
         self._set_selected_anomaly_label(anomaly)
 
@@ -6234,35 +8466,141 @@ class HOIWindow(FrameControlMixin, QWidget):
         """Refresh status bar showing the selected HandOI segment and hand details."""
         if not hasattr(self, "lbl_event_status"):
             return
+        self._update_inspector_tab_labels()
         if self.selected_event_id is None:
+            self.lbl_event_title.setText("No event selected")
+            self.lbl_event_frames.setText("Frames: -")
+            self.lbl_event_meta.setText("Verb: -   Instrument: -   Target: -")
             self.lbl_event_status.setText("No HandOI segment selected.")
+            self._set_status_chip(getattr(self, "lbl_event_actor_chip", None), "Idle", "neutral")
+            self._set_status_chip(getattr(self, "lbl_event_health_chip", None), "Waiting", "neutral")
+            self._set_status_card_tone(getattr(self, "event_status_card", None), "neutral")
+            for btn in (
+                getattr(self, "btn_jump_start_chip", None),
+                getattr(self, "btn_jump_onset_chip", None),
+                getattr(self, "btn_jump_end_chip", None),
+            ):
+                if btn is not None:
+                    btn.setEnabled(False)
             return
 
         hand = self.selected_hand_label
         if hand:
             h_data = self.event_draft.get(hand, {})
+            self._ensure_hand_annotation_state(h_data)
             s = h_data.get("interaction_start")
             o = h_data.get("functional_contact_onset")
             e = h_data.get("interaction_end")
-            s_txt = str(s) if s is not None else "_"
-            o_txt = str(o) if o is not None else "_"
-            e_txt = str(e) if e is not None else "_"
+            s_txt = str(s) if s is not None else "-"
+            o_txt = str(o) if o is not None else "-"
+            e_txt = str(e) if e is not None else "-"
             anom = h_data.get("anomaly_label", "Normal")
-            verb = h_data.get("verb") or "_"
+            verb = h_data.get("verb") or "-"
             inst_id = h_data.get("instrument_object_id")
             target_id = h_data.get("target_object_id")
-            inst_name = "_"
-            target_name = "_"
+            inst_name = "-"
+            target_name = "-"
             for name, id_val in self.global_object_map.items():
                 if inst_id is not None and id_val == inst_id:
                     inst_name = name
                 if target_id is not None and id_val == target_id:
                     target_name = name
-            
+
             actor_label = self._get_actor_full_label(hand)
-            self.lbl_event_status.setText(
-                f"Event {self.selected_event_id} | {actor_label} | "
-                f"S:{s_txt} O:{o_txt} E:{e_txt} | V:{verb} | I:{inst_name} T:{target_name} | A:{anom}"
+            missing = []
+            if s is None or e is None:
+                missing.append("start/end")
+            if o is None:
+                missing.append("onset")
+            if not h_data.get("verb"):
+                missing.append("verb")
+            if inst_id is None:
+                missing.append("instrument")
+            if target_id is None:
+                missing.append("target")
+            evidence_summary = self._sparse_evidence_summary(h_data)
+            evidence_expected = int(evidence_summary.get("expected", 0) or 0)
+            evidence_confirmed = int(evidence_summary.get("confirmed", 0) or 0)
+            evidence_missing = int(evidence_summary.get("missing", 0) or 0)
+            if evidence_missing:
+                missing.append(f"bbox {evidence_confirmed}/{evidence_expected}")
+            suggested_fields = []
+            for field_name in (
+                "interaction_start",
+                "functional_contact_onset",
+                "interaction_end",
+                "verb",
+                "instrument_object_id",
+                "target_object_id",
+            ):
+                state = get_field_state(h_data, field_name)
+                if state.get("status") == "suggested":
+                    suggested_fields.append(field_name)
+            if missing:
+                tone = "warn"
+                health_text = f"Missing {len(missing)}"
+            elif suggested_fields:
+                tone = "warn"
+                health_text = f"Review {len(suggested_fields)}"
+            elif evidence_expected > 0:
+                tone = "ok"
+                health_text = f"Evidence {evidence_confirmed}/{evidence_expected}"
+            else:
+                tone = "ok"
+                health_text = "Ready"
+
+            self.lbl_event_title.setText(f"Event {self.selected_event_id}")
+            self.lbl_event_frames.setText(f"Frames  Start {s_txt}   Onset {o_txt}   End {e_txt}")
+            self.lbl_event_meta.setText(
+                f"Verb: {verb}   Instrument: {inst_name}   Target: {target_name}   Anomaly: {anom}"
             )
+            if missing:
+                status_text = "Missing: " + ", ".join(missing)
+            elif suggested_fields:
+                labels = [
+                    {
+                        "interaction_start": "start",
+                        "functional_contact_onset": "onset",
+                        "interaction_end": "end",
+                        "verb": "verb",
+                        "instrument_object_id": "instrument",
+                        "target_object_id": "target",
+                    }.get(name, name)
+                    for name in suggested_fields
+                ]
+                status_text = "Suggested, needs confirmation: " + ", ".join(labels)
+            else:
+                if evidence_expected > 0:
+                    status_text = (
+                        f"Complete event ready for review. Sparse evidence {evidence_confirmed}/{evidence_expected} grounded."
+                    )
+                else:
+                    status_text = "Complete event ready for review."
+            self.lbl_event_status.setText(status_text)
+            self._set_status_chip(getattr(self, "lbl_event_actor_chip", None), actor_label, "neutral")
+            self._set_status_chip(getattr(self, "lbl_event_health_chip", None), health_text, tone)
+            self._set_status_card_tone(
+                getattr(self, "event_status_card", None),
+                "active" if not missing and not suggested_fields else "warn",
+            )
+            if getattr(self, "btn_jump_start_chip", None):
+                self.btn_jump_start_chip.setEnabled(s is not None)
+            if getattr(self, "btn_jump_onset_chip", None):
+                self.btn_jump_onset_chip.setEnabled(o is not None)
+            if getattr(self, "btn_jump_end_chip", None):
+                self.btn_jump_end_chip.setEnabled(e is not None)
         else:
+            self.lbl_event_title.setText(f"Event {self.selected_event_id}")
+            self.lbl_event_frames.setText("Frames: -")
+            self.lbl_event_meta.setText("Select an actor row to edit its metadata.")
             self.lbl_event_status.setText(f"Event {self.selected_event_id} selected.")
+            self._set_status_chip(getattr(self, "lbl_event_actor_chip", None), "No actor", "warn")
+            self._set_status_chip(getattr(self, "lbl_event_health_chip", None), "Pending", "warn")
+            self._set_status_card_tone(getattr(self, "event_status_card", None), "warn")
+            for btn in (
+                getattr(self, "btn_jump_start_chip", None),
+                getattr(self, "btn_jump_onset_chip", None),
+                getattr(self, "btn_jump_end_chip", None),
+            ):
+                if btn is not None:
+                    btn.setEnabled(False)

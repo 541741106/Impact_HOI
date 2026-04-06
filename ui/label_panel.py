@@ -92,6 +92,8 @@ class LabelPanel(QWidget):
         self._item_fg = QColor(32, 32, 32)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
 
         search_row = QHBoxLayout()
         self.search_edit = QLineEdit(self)
@@ -159,6 +161,15 @@ class LabelPanel(QWidget):
         self.btn_del = QPushButton("Remove Selected")
         root.addWidget(self.btn_del)
 
+        self._admin_visible = True
+        self._admin_widgets = [
+            self.edit,
+            self.id_spin,
+            self.combo,
+            self.btn_add,
+            self.btn_del,
+        ]
+
         self.btn_add.clicked.connect(self._add)
         self.btn_del.clicked.connect(self._del)
         self.combo.activated[int].connect(self._maybe_pick_custom)
@@ -196,6 +207,14 @@ class LabelPanel(QWidget):
         else:
             self.obj_col.show()
             self.split.setSizes([1, 2])
+
+    def set_admin_visible(self, on: bool):
+        self._admin_visible = bool(on)
+        for widget in getattr(self, "_admin_widgets", []):
+            widget.setVisible(self._admin_visible)
+
+    def admin_visible(self) -> bool:
+        return bool(getattr(self, "_admin_visible", True))
 
     def _is_no_split_label(self, text: str) -> bool:
         if not text:
@@ -237,12 +256,14 @@ class LabelPanel(QWidget):
         return verb, obj
 
     def _label_names_for_display(self) -> List[str]:
+        names = [lb.name for lb in self.labels]
         if self._candidate_only and self._candidate_order:
-            name_set = {lb.name for lb in self.labels}
-            names = [name for name in self._candidate_order if name in name_set]
-            if names:
-                return names
-        return [lb.name for lb in self.labels]
+            name_set = set(names)
+            prioritized = [name for name in self._candidate_order if name in name_set]
+            if prioritized:
+                remainder = [name for name in names if name not in prioritized]
+                return prioritized + remainder
+        return names
 
     def _notify_selection(self):
         if not callable(self.on_select_idx):
@@ -261,6 +282,12 @@ class LabelPanel(QWidget):
 
     def current_label_name(self) -> str:
         return self._selected_label_name or ""
+
+    def clear_selection(self):
+        self._selected_verb = None
+        self._selected_label_name = None
+        self.refresh()
+        self._notify_selection()
 
     def select_label_by_name(self, name: str) -> bool:
         if not name:
@@ -348,29 +375,30 @@ class LabelPanel(QWidget):
         self.verb_list.blockSignals(True)
         self.verb_list.clear()
         for verb in visible_verbs:
-            item = QListWidgetItem(verb)
+            verb_candidates = [
+                it.get("conf")
+                for it in verb_items.get(verb, [])
+                if it.get("candidate") and it.get("conf") is not None
+            ]
+            top_conf = max(verb_candidates) if verb_candidates else None
+            item_text = verb
+            if top_conf is not None:
+                item_text = f"{verb} ({top_conf:.0%})"
+            item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, verb)
-            base_bg = (
-                QColor(240, 249, 255) if self._candidate_only else QColor(Qt.white)
-            )
+            is_candidate_verb = bool(verb_candidates)
+            base_bg = QColor(240, 249, 255) if is_candidate_verb else QColor(Qt.white)
             if search_text and verb_match.get(verb):
                 item.setBackground(QColor(255, 248, 196))
             else:
                 item.setBackground(base_bg)
             item.setForeground(self._item_fg)
-            if self._candidate_only:
+            if is_candidate_verb:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
+                item.setToolTip("Suggested by VideoMAE")
             self.verb_list.addItem(item)
-        if self._candidate_only and visible_verbs:
-            other = QListWidgetItem("Other label...")
-            other.setData(Qt.UserRole, self._other_token)
-            font = other.font()
-            font.setItalic(True)
-            other.setFont(font)
-            other.setForeground(self._item_fg)
-            self.verb_list.addItem(other)
 
         if self._selected_verb and self._selected_verb in visible_verbs:
             self.verb_list.setCurrentRow(visible_verbs.index(self._selected_verb))
