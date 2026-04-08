@@ -1,4 +1,5 @@
 import csv
+import json
 from datetime import datetime
 from typing import Dict, Any, List
 import os
@@ -17,15 +18,33 @@ class OperationLogger:
         self.max_rows = max(1, int(max_rows))
         self._rows: List[Dict[str, Any]] = []
         self.started_at = datetime.now().isoformat(timespec="seconds")
+        self._started_dt = datetime.now()
+        self.session_id = self._started_dt.strftime("%Y%m%dT%H%M%S")
+
+    def _serialize_value(self, value: Any) -> Any:
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple, set, dict)):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(value)
+        return str(value)
 
     def log(self, event: str, **fields):
         if not self.enabled:
             return
+        now = datetime.now()
         row = {
-            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "timestamp": now.isoformat(timespec="milliseconds"),
             "event": event,
+            "session_id": self.session_id,
+            "elapsed_ms": int((now - self._started_dt).total_seconds() * 1000.0),
         }
-        row.update(fields)
+        for key, value in fields.items():
+            row[str(key)] = self._serialize_value(value)
         self._rows.append(row)
         if len(self._rows) > self.max_rows:
             del self._rows[: len(self._rows) - self.max_rows]
@@ -48,3 +67,6 @@ class OperationLogger:
 
     def clear(self):
         self._rows.clear()
+
+    def rows(self) -> List[Dict[str, Any]]:
+        return [dict(row) for row in self._rows]

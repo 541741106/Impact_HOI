@@ -55,11 +55,6 @@ from ui.entities_panel import EntitiesPanel
 from ui.action_workers import (
     ASOTInferWorker,
     ASOTRemapBuildWorker,
-    EASTInferWorker,
-    EASTMaskedRefreshWorker,
-    EASTOnlineAdapterTrainWorker,
-    EASTOnlineUpdateWorker,
-    EASTBatchWorker,
     FactBatchWorker,
     FeatureExtractWorker,
     load_feature_extractor_module,
@@ -108,7 +103,6 @@ from utils.shortcut_settings import (
     shortcut_value,
     set_shortcut_key,
 )
-from utils.east_ui_state import load_east_ui_state, save_east_ui_state
 from utils.default_action_label_templates import get_default_action_label_template
 from tools.label_utils import (
     DEFAULT_VERB_PREFIXES,
@@ -124,18 +118,17 @@ from core.psr_state import (
     build_state_runs as psr_build_state_runs,
 )
 from core.action_corrections import CorrectionBuffer
+from core.structured_event_graph import (
+    event_graph_sidecar_path,
+    extract_consistency_flags,
+    extract_locked_regions,
+    extract_onset_anchors,
+    load_event_graph_sidecar,
+)
 from core.asr_worker import (
     probe_audio_stream,
     extract_wav_16k_mono_verbose,
     ensure_cached_wav_16k_mono_verbose,
-)
-from core.east_shared_assets import (
-    consolidate_east_shared_adapter,
-    export_east_runtime_report,
-    export_runtime_as_shared_adapter,
-    inspect_east_runtime_assets,
-    inspect_east_shared_adapter_bundle,
-    load_east_runtime_confusion_map,
 )
 from ui.timeline import TranscriptSegment, TranscriptTrack
 from ui.psr_rules_dialog import PSRRulesDialog
@@ -281,63 +274,15 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.asr_lang = "auto"
         self._transcript_current_index = -1
         self._transcript_result_cache: Dict[str, List[TranscriptSegment]] = {}
-        self.currentEastFeatureDir: Optional[str] = None
         self._feature_followup_task: str = ""
-        self._feature_followup_backbone: str = ""
-        self._east_ckpt: str = ""
-        self._east_cfg: str = ""
-        self._east_text_bank_version: str = str(
-            os.environ.get("EAST_TEXT_BANK_BACKEND")
-            or os.environ.get("EAST_TEXT_BANK_VERSION", "auto")
-            or "auto"
-        )
-        self._east_category_adapter_path: str = ""
-        self._east_masked_refresh_context_override: int = 0
         self._action_label_bank_source: str = ""
         self._correction_buffer = CorrectionBuffer()
         self._confirmed_correction_records: List[Dict[str, Any]] = []
         self._pending_finalized_records: List[Dict[str, Any]] = []
-        self._east_online_update_thread = None
-        self._east_online_update_worker = None
-        self._east_online_update_running = False
-        self._east_online_update_pending = False
-        self._east_online_update_pending_dir = ""
-        self._east_online_update_timer = QTimer(self)
-        self._east_online_update_timer.setSingleShot(True)
-        self._east_online_update_timer.setInterval(600)
-        self._east_online_update_timer.timeout.connect(
-            self._flush_east_online_update
-        )
-        self._east_online_adapter_thread = None
-        self._east_online_adapter_worker = None
-        self._east_online_adapter_running = False
-        self._east_online_adapter_pending = False
-        self._east_online_adapter_pending_dir = ""
-        self._east_online_adapter_timer = QTimer(self)
-        self._east_online_adapter_timer.setSingleShot(True)
-        self._east_online_adapter_timer.setInterval(900)
-        self._east_online_adapter_timer.timeout.connect(
-            self._flush_east_online_adapter_update
-        )
-        self._east_masked_refresh_thread = None
-        self._east_masked_refresh_worker = None
-        self._east_masked_refresh_running = False
-        self._east_masked_refresh_pending = False
-        self._east_masked_refresh_pending_dir = ""
         self._last_feature_error_message = ""
-        self._east_masked_refresh_timer = QTimer(self)
-        self._east_masked_refresh_timer.setSingleShot(True)
-        self._east_masked_refresh_timer.setInterval(1200)
-        self._east_masked_refresh_timer.timeout.connect(
-            self._flush_east_masked_refresh
-        )
-        self._east_skip_next_masked_refresh = False
-        self._east_batch_thread = None
-        self._east_batch_worker = None
-        self._east_batch_progress = None
-        self._east_batch_done = 0
-        self._east_batch_current = 0
-        self._east_batch_total = None
+        self._asot_remap_thread = None
+        self._asot_remap_worker = None
+        self._asot_remap_progress = None
         self._asot_remap_thread = None
         self._asot_remap_worker = None
         self._asot_remap_progress = None
@@ -354,6 +299,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self.current_annotation_path: Optional[str] = None
         self.currentFeatureDir: Optional[str] = None
+        self._structured_event_graph: Dict[str, Any] = {}
+        self._onset_anchors: List[Dict[str, Any]] = []
+        self._event_locked_regions: List[Dict[str, Any]] = []
+        self._event_graph_consistency_flags: List[Dict[str, Any]] = []
         self.extra_mode = False
         self.extra_label: Optional[LabelDef] = None
         self.extra_start_frame = 0
@@ -570,14 +519,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 [
                     "ASOT: Build Label Remap...",
                     "Batch Pre-label...",
-                    "EAST Setup...",
-                    "EAST: Finalize Current Video",
-                    "EAST: Inspect Runtime Assets",
-                    "EAST: Export Runtime Report...",
-                    "EAST: Export Shared Adapter...",
-                    "EAST: Select Shared Adapter...",
-                    "EAST: Clear Shared Adapter",
-                    "EAST: Consolidate Shared Adapter...",
                 ],
             ),
             (
@@ -610,8 +551,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._action_items = [item for _, items in self._action_groups for item in items]
         self._action_section_headers: Set[str] = set()
         self.combo_actions.addItem("Choose action...")
-        self._refresh_east_backend_defaults()
-        self._restore_east_ui_state()
         self._apply_psr_action_dropdown(False)
         ctrl.addWidget(self.combo_actions)
         ctrl.addSpacing(12)
@@ -640,10 +579,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         ctrl.addWidget(self.btn_settings)
 
         ctrl.addSpacing(12)
-        self.btn_auto_label = QPushButton("EAST Refine")
-        self.btn_auto_label.setToolTip("EAST refinement for the current video")
-        self.btn_auto_label.clicked.connect(self.on_click_auto_label)
-        ctrl.addWidget(self.btn_auto_label)
         self.btn_auto_label_asot = QPushButton("ASOT Pre-label")
         self.btn_auto_label_asot.setToolTip("ASOT pre-labeling for the current video")
         self.btn_auto_label_asot.clicked.connect(self.on_click_auto_label_asot)
@@ -2366,10 +2301,10 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _correction_features_dir(self) -> Optional[str]:
         for raw in (
-            getattr(self, "currentEastFeatureDir", None),
-            self._default_east_features_dir_for_video(),
+            getattr(self, 'currentFeatureDir', None),
+            self._default_features_dir_for_video(),
         ):
-            path = str(raw or "").strip()
+            path = str(raw or '').strip()
             if not path:
                 continue
             path = os.path.abspath(path)
@@ -2397,117 +2332,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         if self.views and 0 <= self.active_view_idx < len(self.views):
             self.views[self.active_view_idx]["prelabel_source"] = text
 
-    def _east_runtime_meta_path(self, features_dir: Optional[str]) -> str:
-        path = os.path.abspath(os.path.expanduser(str(features_dir or "").strip()))
-        if not path:
-            return ""
-        return os.path.join(path, "east_runtime", "meta.json")
 
-    def _load_east_runtime_meta(self, features_dir: Optional[str]) -> Dict[str, Any]:
-        meta_path = self._east_runtime_meta_path(features_dir)
-        if not meta_path or not os.path.isfile(meta_path):
-            return {}
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            return obj if isinstance(obj, dict) else {}
-        except Exception:
-            return {}
 
-    def _update_east_runtime_meta(self, features_dir: Optional[str], **fields: Any) -> bool:
-        meta_path = self._east_runtime_meta_path(features_dir)
-        if not meta_path:
-            return False
-        try:
-            os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-            meta = self._load_east_runtime_meta(features_dir)
-            meta.update(fields)
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=True, indent=2, default=str)
-            return True
-        except Exception:
-            return False
 
-    def _east_runtime_debug_context(
-        self,
-        report: Optional[Dict[str, Any]] = None,
-        *,
-        features_dir: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        active_features_dir = str(features_dir or "") or str(
-            (report or {}).get("features_dir") or ""
-        )
-        active_features_dir = (
-            os.path.abspath(os.path.expanduser(active_features_dir.strip()))
-            if active_features_dir.strip()
-            else ""
-        )
-        runtime_ok = bool((report or {}).get("ok", False))
-        runtime_meta = dict((report or {}).get("runtime_meta") or {})
-        if not runtime_meta:
-            runtime_meta = self._load_east_runtime_meta(active_features_dir)
-        baseline_source = str(self._active_label_baseline_source() or "").strip().upper()
-        try:
-            confirmed_count = int(
-                len(self._rebuild_confirmed_correction_records_for_active_view())
-            )
-        except Exception:
-            confirmed_count = int(
-                len(getattr(self, "_confirmed_correction_records", []) or [])
-            )
-        features_ready = bool(
-            active_features_dir
-            and os.path.isfile(os.path.join(active_features_dir, "features.npy"))
-        )
-        bootstrap_source = str(
-            runtime_meta.get("bootstrap_source") or baseline_source or ""
-        ).strip().upper()
-        bootstrap_pending = bool(runtime_meta.get("bootstrap_pending", False))
-        bootstrap_completed = bool(runtime_meta.get("bootstrap_completed", False))
-        runtime_origin = str(runtime_meta.get("runtime_origin") or "").strip().lower()
-        if runtime_ok:
-            if runtime_origin == "bootstrapped" or bootstrap_source or bootstrap_pending or bootstrap_completed:
-                runtime_source = "bootstrapped"
-                source_name = bootstrap_source or baseline_source or "CONFIRMED_SUPERVISION"
-                runtime_source_label = f"{source_name} bootstrapped to EAST"
-            else:
-                runtime_source = "native_east"
-                runtime_source_label = "Native EAST runtime"
-        else:
-            runtime_source = "not_initialized"
-            runtime_source_label = (
-                "EAST features ready; runtime not initialized"
-                if features_ready
-                else "EAST not initialized"
-            )
-        return {
-            "runtime_available": bool(runtime_ok),
-            "runtime_status_reason": str((report or {}).get("reason") or ""),
-            "baseline_source": baseline_source,
-            "current_confirmed_record_count": int(confirmed_count),
-            "features_ready": bool(features_ready),
-            "runtime_source": runtime_source,
-            "runtime_source_label": runtime_source_label,
-            "bootstrap_source": bootstrap_source,
-            "bootstrap_pending": bool(bootstrap_pending),
-            "bootstrap_completed": bool(bootstrap_completed),
-            "bootstrap_confirmed_count": int(
-                runtime_meta.get(
-                    "bootstrap_confirmed_count",
-                    confirmed_count if confirmed_count > 0 else 0,
-                )
-                or 0
-            ),
-            "bootstrap_initialized_at": str(
-                runtime_meta.get("bootstrap_initialized_at") or ""
-            ),
-            "bootstrap_refresh_deferred": bool(
-                runtime_meta.get("bootstrap_refresh_deferred", False)
-            ),
-        }
 
-    def _east_online_updates_allowed(self) -> bool:
-        return True
 
     def _active_explicit_confirm_records(self, create: bool = False) -> List[Dict[str, Any]]:
         if not (self.views and 0 <= self.active_view_idx < len(self.views)):
@@ -2747,33 +2575,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self,
         label_name: str,
     ) -> List[str]:
-        target = str(label_name or "").strip()
-        if not target:
-            return []
-        features_dir = self._correction_features_dir()
-        if not features_dir:
-            return []
-        try:
-            confusion_map = load_east_runtime_confusion_map(features_dir)
-        except Exception:
-            return []
-        row = dict(confusion_map.get(target) or {})
-        if not row:
-            return []
-        try:
-            limit = int(os.environ.get("EAST_CONFUSION_MEMORY_TOPK", "3") or 3)
-        except Exception:
-            limit = 3
-        limit = max(0, min(8, int(limit)))
-        ordered = sorted(
-            (
-                (str(name).strip(), float(score))
-                for name, score in row.items()
-                if str(name).strip() and str(name).strip() != target
-            ),
-            key=lambda item: (-float(item[1]), str(item[0])),
-        )
-        return [name for name, _score in ordered[:limit]]
+        return []
 
     def _store_diff_records_for_active_view(self) -> List[Dict[str, Any]]:
         if not self.views or not (0 <= self.active_view_idx < len(self.views)):
@@ -3190,16 +2992,14 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _write_correction_record_buffer(
         self, records: List[Dict[str, Any]], *, force: bool = False
     ) -> bool:
-        if not force and not self._east_online_updates_allowed():
-            return False
         features_dir = self._correction_features_dir()
         if not features_dir:
             return False
-        runtime_dir = os.path.join(features_dir, "east_runtime")
+        runtime_dir = os.path.join(features_dir, 'interactive_runtime')
         try:
             os.makedirs(runtime_dir, exist_ok=True)
-            path = os.path.join(runtime_dir, "record_buffer.pkl")
-            with open(path, "wb") as f:
+            path = os.path.join(runtime_dir, 'record_buffer.pkl')
+            with open(path, 'wb') as f:
                 pickle.dump(list(records or []), f)
             return True
         except Exception:
@@ -3208,40 +3008,19 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _write_finalized_record_buffer(
         self, records: List[Dict[str, Any]], *, force: bool = False
     ) -> bool:
-        if not force and not self._east_online_updates_allowed():
-            return False
         features_dir = self._correction_features_dir()
         if not features_dir:
             return False
-        runtime_dir = os.path.join(features_dir, "east_runtime")
+        runtime_dir = os.path.join(features_dir, 'interactive_runtime')
         try:
             os.makedirs(runtime_dir, exist_ok=True)
-            path = os.path.join(runtime_dir, "finalized_record_buffer.pkl")
-            with open(path, "wb") as f:
+            path = os.path.join(runtime_dir, 'finalized_record_buffer.pkl')
+            with open(path, 'wb') as f:
                 pickle.dump(list(records or []), f)
             return True
         except Exception:
             return False
 
-    def _invalidate_east_video_finalization(
-        self, features_dir: Optional[str] = None
-    ) -> None:
-        path = str(features_dir or self._correction_features_dir() or "").strip()
-        if not path:
-            return
-        runtime_dir = os.path.join(os.path.abspath(path), "east_runtime")
-        finalized_path = os.path.join(runtime_dir, "finalized_record_buffer.pkl")
-        try:
-            if os.path.isfile(finalized_path):
-                os.remove(finalized_path)
-        except Exception:
-            pass
-        self._update_east_runtime_meta(
-            path,
-            video_finalized=False,
-            finalized_record_count=0,
-            finalized_at="",
-        )
 
     def _build_finalized_supervision_records_for_active_view(self) -> List[Dict[str, Any]]:
         if not self.views or not (0 <= self.active_view_idx < len(self.views)):
@@ -3367,538 +3146,44 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         return records
 
-    def _finalize_current_video_for_east(self) -> None:
-        if not getattr(self, "video_path", None):
-            QMessageBox.information(
-                self, "Finalize Current Video", "Load a video first."
-            )
-            return
-        records = self._build_finalized_supervision_records_for_active_view()
-        if not records:
-            QMessageBox.information(
-                self,
-                "Finalize Current Video",
-                "There are no labeled segments to finalize for the current video.",
-            )
-            return
-        feat_dir = self._ensure_east_features_for_current_video()
-        if not feat_dir:
-            return
-        feat_dir = os.path.abspath(feat_dir)
-        self.currentEastFeatureDir = feat_dir
-        self._pending_finalized_records = list(records)
-        self._update_east_runtime_meta(
-            feat_dir,
-            video_finalized=False,
-            finalized_record_count=int(len(records)),
-            finalized_pending=True,
-        )
-        if os.path.isfile(os.path.join(feat_dir, "features.npy")):
-            persisted = self._write_finalized_record_buffer(records, force=True)
-            if not persisted:
-                QMessageBox.warning(
-                    self,
-                    "Finalize Current Video",
-                    "Failed to persist finalized supervision for the current video.",
-                )
-                return
-            self._update_east_runtime_meta(
-                feat_dir,
-                video_finalized=True,
-                finalized_pending=False,
-                finalized_record_count=int(len(records)),
-                finalized_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            )
-            self._set_status(
-                "Current video finalized for EAST offline supervision. Updating runtime..."
-            )
-            self._schedule_east_online_update(feat_dir)
-            return
-        if not self._ensure_east_runtime_ready(
-            feature_name="Finalize Current Video",
-            unavailable_status=(
-                "Finalizing the current video requires a full EAST-main checkout and the EAST runtime dependencies."
-            ),
-            show_dialog=True,
-        ):
-            return
-        if not self._ensure_east_model_paths():
-            return
-        self._set_status(
-            "Building EAST backbone features before finalizing the current video..."
-        )
-        self._start_feature_extraction(
-            feat_dir,
-            next_task="east_finalize",
-            backbone="east_backbone",
-        )
 
     def _begin_correction_session(self, kind: str, **meta) -> None:
         self._correction_buffer.begin(kind, meta=meta, replace=True)
 
     def _note_correction_step(self, count: int = 1) -> None:
         self._correction_buffer.note_step(count)
-        if int(count or 0) > 0:
-            self._invalidate_east_video_finalization()
 
     def _commit_correction_session(self, **meta_update) -> Dict[str, Any]:
         records = self._rebuild_confirmed_correction_records_for_active_view()
-        features_dir = self._correction_features_dir()
         persisted = self._write_correction_record_buffer(records)
         if meta_update:
             meta_update = dict(meta_update)
         else:
             meta_update = {}
-        meta_update["persisted"] = bool(persisted)
+        meta_update['persisted'] = bool(persisted)
         summary = self._correction_buffer.commit(records=records, meta_update=meta_update)
-        if persisted and features_dir and self._east_online_updates_allowed():
-            self._schedule_east_online_update(features_dir)
-        elif records and self._east_online_updates_allowed():
-            self._maybe_bootstrap_east_runtime_from_confirmed_supervision(records)
         return summary
 
     def _discard_correction_session(self, reason: str = "") -> None:
         self._correction_buffer.discard(reason=reason)
 
-    def _maybe_bootstrap_east_runtime_from_confirmed_supervision(
-        self, records: Optional[List[Dict[str, Any]]] = None
-    ) -> bool:
-        rows = list(records or self._confirmed_correction_records or [])
-        if not rows or not getattr(self, "video_path", None):
-            return False
-        bootstrap_source = str(
-            self._active_label_baseline_source() or "CONFIRMED_SUPERVISION"
-        ).strip().upper()
-        existing = str(getattr(self, "currentEastFeatureDir", "") or "").strip()
-        if existing and os.path.isfile(os.path.join(existing, "features.npy")):
-            return False
-        feat_dir = self._ensure_east_features_for_current_video()
-        if not feat_dir:
-            return False
-        feat_dir = os.path.abspath(feat_dir)
-        if os.path.isfile(os.path.join(feat_dir, "features.npy")):
-            self.currentEastFeatureDir = feat_dir
-            self._update_east_runtime_meta(
-                feat_dir,
-                runtime_origin="bootstrapped",
-                bootstrap_source=bootstrap_source,
-                bootstrap_pending=False,
-                bootstrap_completed=False,
-                bootstrap_confirmed_count=int(len(rows)),
-                bootstrap_initialized_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                bootstrap_refresh_deferred=True,
-            )
-            if not self._write_correction_record_buffer(rows, force=True):
-                return False
-            self._update_east_runtime_meta(
-                feat_dir,
-                runtime_origin="bootstrapped",
-                bootstrap_source=bootstrap_source,
-                bootstrap_pending=False,
-                bootstrap_completed=True,
-                bootstrap_confirmed_count=int(len(rows)),
-                bootstrap_refresh_deferred=True,
-            )
-            self._east_skip_next_masked_refresh = True
-            self._set_status(
-                "Initialized EAST runtime from confirmed supervision. Starting online update..."
-            )
-            self._schedule_east_online_update(feat_dir)
-            return True
-        if not self._ensure_feature_extractor_available(show_dialog=True):
-            return False
-        if not self._ensure_east_model_paths():
-            return False
-        self._update_east_runtime_meta(
-            feat_dir,
-            runtime_origin="bootstrapped",
-            bootstrap_source=bootstrap_source,
-            bootstrap_pending=True,
-            bootstrap_completed=False,
-            bootstrap_confirmed_count=int(len(rows)),
-            bootstrap_initialized_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            bootstrap_refresh_deferred=True,
-        )
-        self._east_skip_next_masked_refresh = True
-        self._set_status(
-            "Building EAST backbone features from confirmed supervision in background..."
-        )
-        self._start_feature_extraction(feat_dir, next_task="east_bootstrap", backbone="east_backbone")
-        return True
 
-    def _schedule_east_online_update(self, features_dir: Optional[str] = None) -> None:
-        path = str(features_dir or self._correction_features_dir() or "").strip()
-        if not path:
-            return
-        path = os.path.abspath(path)
-        if not os.path.isdir(path):
-            return
-        self._east_online_update_pending = True
-        self._east_online_update_pending_dir = path
-        if self._east_online_update_running:
-            return
-        try:
-            self._east_online_update_timer.start()
-        except Exception:
-            self._flush_east_online_update()
 
-    def _flush_east_online_update(self) -> None:
-        if self._east_online_update_running or not self._east_online_update_pending:
-            return
-        features_dir = str(self._east_online_update_pending_dir or "").strip()
-        self._east_online_update_pending = False
-        self._east_online_update_pending_dir = ""
-        if not features_dir:
-            return
-        self._start_east_online_update(features_dir)
 
-    def _start_east_online_update(self, features_dir: str) -> None:
-        path = os.path.abspath(os.path.expanduser(str(features_dir or "")))
-        if not path or not os.path.isdir(path):
-            return
-        if self._east_online_update_running:
-            self._east_online_update_pending = True
-            self._east_online_update_pending_dir = path
-            return
-        self._east_online_update_running = True
-        self._east_online_update_thread = QThread(self)
-        self._east_online_update_worker = EASTOnlineUpdateWorker(
-            features_dir=path,
-            trim_ratio=self._segment_embedding_cfg(),
-        )
-        self._east_online_update_worker.moveToThread(self._east_online_update_thread)
-        self._east_online_update_thread.started.connect(self._east_online_update_worker.run)
-        self._east_online_update_worker.progress.connect(self._set_status)
-        self._east_online_update_worker.done.connect(self._on_east_online_update_done)
-        self._east_online_update_worker.done.connect(self._east_online_update_thread.quit)
-        self._east_online_update_thread.finished.connect(
-            self._east_online_update_worker.deleteLater
-        )
-        self._east_online_update_thread.finished.connect(
-            self._east_online_update_thread.deleteLater
-        )
-        self._east_online_update_thread.start()
 
-    def _on_east_online_update_done(self, stats: Any) -> None:
-        self._east_online_update_running = False
-        if self._east_online_update_timer.isActive():
-            try:
-                self._east_online_update_timer.stop()
-            except Exception:
-                pass
-        data = stats if isinstance(stats, dict) else {}
-        if bool(data.get("ok", False)):
-            if bool(data.get("changed", False)):
-                record_count = int(data.get("record_count", 0) or 0)
-                proto_count = int(data.get("prototype_count", 0) or 0)
-                transition_count = int(data.get("transition_delta_count", 0) or 0)
-                if record_count > 0:
-                    self._set_status(
-                        "EAST online update ready in background "
-                        f"({record_count} confirmed corrections, {proto_count} prototypes, {transition_count} transition pairs)."
-                    )
-                else:
-                    self._set_status(
-                        "EAST online update cleared stale correction state for the current runtime."
-                    )
-        else:
-            err = str(data.get("error", "") or "").strip()
-            if err:
-                self._set_status(f"EAST online update skipped: {err}")
-        self._east_online_update_worker = None
-        self._east_online_update_thread = None
-        if bool(data.get("ok", False)):
-            self._schedule_east_online_adapter_update(
-                str(data.get("features_dir") or self._correction_features_dir() or "")
-            )
-        if self._east_online_update_pending and self._east_online_update_pending_dir:
-            self._east_online_update_timer.start()
 
-    def _schedule_east_online_adapter_update(self, features_dir: Optional[str] = None) -> None:
-        path = str(features_dir or self._correction_features_dir() or "").strip()
-        if not path:
-            return
-        path = os.path.abspath(path)
-        if not os.path.isdir(path):
-            return
-        self._east_online_adapter_pending = True
-        self._east_online_adapter_pending_dir = path
-        if self._east_online_adapter_running:
-            return
-        try:
-            self._east_online_adapter_timer.start()
-        except Exception:
-            self._flush_east_online_adapter_update()
 
-    def _flush_east_online_adapter_update(self) -> None:
-        if self._east_online_adapter_running or not self._east_online_adapter_pending:
-            return
-        features_dir = str(self._east_online_adapter_pending_dir or "").strip()
-        self._east_online_adapter_pending = False
-        self._east_online_adapter_pending_dir = ""
-        if not features_dir:
-            return
-        self._start_east_online_adapter_update(features_dir)
 
-    def _start_east_online_adapter_update(self, features_dir: str) -> None:
-        path = os.path.abspath(os.path.expanduser(str(features_dir or "")))
-        if not path or not os.path.isdir(path):
-            return
-        if self._east_online_adapter_running:
-            self._east_online_adapter_pending = True
-            self._east_online_adapter_pending_dir = path
-            return
-        self._east_online_adapter_running = True
-        self._east_online_adapter_thread = QThread(self)
-        self._east_online_adapter_worker = EASTOnlineAdapterTrainWorker(path)
-        self._east_online_adapter_worker.moveToThread(self._east_online_adapter_thread)
-        self._east_online_adapter_thread.started.connect(self._east_online_adapter_worker.run)
-        self._east_online_adapter_worker.progress.connect(self._set_status)
-        self._east_online_adapter_worker.done.connect(self._on_east_online_adapter_done)
-        self._east_online_adapter_worker.done.connect(self._east_online_adapter_thread.quit)
-        self._east_online_adapter_thread.finished.connect(
-            self._east_online_adapter_worker.deleteLater
-        )
-        self._east_online_adapter_thread.finished.connect(
-            self._east_online_adapter_thread.deleteLater
-        )
-        self._east_online_adapter_thread.start()
 
-    def _schedule_east_masked_refresh(self, features_dir: Optional[str] = None) -> None:
-        path = str(features_dir or self._correction_features_dir() or "").strip()
-        if not path:
-            return
-        path = os.path.abspath(path)
-        if not os.path.isdir(path):
-            return
-        self._east_masked_refresh_pending = True
-        self._east_masked_refresh_pending_dir = path
-        if self._east_masked_refresh_running:
-            return
-        try:
-            self._east_masked_refresh_timer.start()
-        except Exception:
-            self._flush_east_masked_refresh()
 
-    def _flush_east_masked_refresh(self) -> None:
-        if self._east_masked_refresh_running or not self._east_masked_refresh_pending:
-            return
-        features_dir = str(self._east_masked_refresh_pending_dir or "").strip()
-        self._east_masked_refresh_pending = False
-        self._east_masked_refresh_pending_dir = ""
-        if not features_dir:
-            return
-        ok, reason = self._masked_refresh_safe_state(features_dir)
-        if not ok:
-            if reason in {
-                "interaction_busy",
-                "east_refine_running",
-                "online_update_running",
-            }:
-                self._east_masked_refresh_pending = True
-                self._east_masked_refresh_pending_dir = features_dir
-                self._east_masked_refresh_timer.start()
-            return
-        self._start_east_masked_refresh(features_dir)
 
-    def _start_east_masked_refresh(self, features_dir: str) -> None:
-        path = os.path.abspath(os.path.expanduser(str(features_dir or "")))
-        if not path or not os.path.isdir(path):
-            return
-        ok, _reason = self._masked_refresh_safe_state(path)
-        if not ok:
-            return
-        if not self._ensure_east_model_paths():
-            return
-        windows = self._masked_refresh_windows(path)
-        if not windows:
-            return
-        label_txt = self._prepare_east_labels_file(path)
-        if not label_txt:
-            return
-        meta = self._load_feature_meta(path)
-        feature_backbone_version = str(
-            meta.get("backbone")
-            or meta.get("source")
-            or meta.get("feature_backbone_version")
-            or "east_backbone"
-        ).strip()
-        video_id = (
-            str(getattr(self, "current_video_id", "") or "").strip()
-            or os.path.splitext(os.path.basename(str(getattr(self, "video_path", "") or "")))[0]
-            or os.path.basename(os.path.abspath(path))
-        )
-        log_path = os.path.join(path, "pred_east_masked_refresh.log")
-        self._east_masked_refresh_running = True
-        self._east_masked_refresh_thread = QThread(self)
-        self._east_masked_refresh_worker = EASTMaskedRefreshWorker(
-            features_dir=path,
-            video_id=video_id,
-            windows=windows,
-            video_path=str(getattr(self, "video_path", "") or ""),
-            labels_txt=label_txt,
-            ckpt=self._east_ckpt,
-            cfg=self._east_cfg,
-            text_bank_version=self._east_text_bank_version,
-            feature_backbone_version=feature_backbone_version,
-            category_adapter=self._effective_east_shared_adapter_path(),
-            out_prefix="pred_east_masked_refresh",
-            log_path=log_path,
-        )
-        self._east_masked_refresh_worker.moveToThread(self._east_masked_refresh_thread)
-        self._east_masked_refresh_thread.started.connect(self._east_masked_refresh_worker.run)
-        self._east_masked_refresh_worker.done.connect(self._on_east_masked_refresh_done)
-        self._east_masked_refresh_worker.done.connect(self._east_masked_refresh_thread.quit)
-        self._east_masked_refresh_thread.finished.connect(
-            self._east_masked_refresh_worker.deleteLater
-        )
-        self._east_masked_refresh_thread.finished.connect(
-            self._east_masked_refresh_thread.deleteLater
-        )
-        self._east_masked_refresh_thread.start()
 
-    def _on_east_masked_refresh_done(self, payload: Any) -> None:
-        self._east_masked_refresh_running = False
-        if self._east_masked_refresh_timer.isActive():
-            try:
-                self._east_masked_refresh_timer.stop()
-            except Exception:
-                pass
-        data = payload if isinstance(payload, dict) else {}
-        try:
-            applied = self._apply_east_predictions_masked_local(data)
-        except Exception:
-            applied = False
-        if applied:
-            applied_count = int(data.get("applied_window_count", 0) or 0)
-            partial = bool(data.get("partial", False))
-            msg = "Updated unlocked regions with the latest EAST refinement."
-            if applied_count > 0:
-                msg = (
-                    f"Updated unlocked regions with the latest EAST refinement "
-                    f"({applied_count} local window{'s' if applied_count != 1 else ''})."
-                )
-            if partial:
-                msg = msg[:-1] + " Partial refresh only."
-            self._set_status(msg)
-        else:
-            err = str(data.get("error", "") or "").strip()
-            if err:
-                self._set_status(f"EAST local refresh skipped: {err}")
-        self._east_masked_refresh_worker = None
-        self._east_masked_refresh_thread = None
-        if self._east_masked_refresh_pending and self._east_masked_refresh_pending_dir:
-            self._east_masked_refresh_timer.start()
 
-    def _on_east_online_adapter_done(self, stats: Any) -> None:
-        self._east_online_adapter_running = False
-        if self._east_online_adapter_timer.isActive():
-            try:
-                self._east_online_adapter_timer.stop()
-            except Exception:
-                pass
-        skip_refresh = bool(getattr(self, "_east_skip_next_masked_refresh", False))
-        self._east_skip_next_masked_refresh = False
-        data = stats if isinstance(stats, dict) else {}
-        if bool(data.get("ok", False)):
-            if bool(data.get("changed", False)):
-                span_count = int(data.get("positive_span_count", 0) or 0)
-                boundary_count = int(data.get("boundary_target_count", 0) or 0)
-                class_count = int(data.get("class_count", 0) or 0)
-                self._set_status(
-                    "EAST online adapter ready in background "
-                    f"({span_count} positive spans, {boundary_count} boundary targets, {class_count} classes)."
-                )
-                if not skip_refresh:
-                    self._schedule_east_masked_refresh(
-                        str(data.get("features_dir") or self._correction_features_dir() or "")
-                    )
-        else:
-            err = str(data.get("error", "") or "").strip()
-            if err:
-                self._set_status(f"EAST online adapter skipped: {err}")
-        self._east_online_adapter_worker = None
-        self._east_online_adapter_thread = None
-        if self._east_online_adapter_pending and self._east_online_adapter_pending_dir:
-            self._east_online_adapter_timer.start()
 
-    def _restore_east_ui_state(self) -> None:
-        try:
-            state = load_east_ui_state()
-        except Exception:
-            state = {}
-        ckpt = os.path.abspath(
-            os.path.expanduser(str(state.get("east_ckpt") or "").strip())
-        )
-        cfg = os.path.abspath(
-            os.path.expanduser(str(state.get("east_cfg") or "").strip())
-        )
-        backend = str(state.get("text_bank_backend") or "").strip().lower()
-        try:
-            refresh_context = int(state.get("masked_refresh_context_frames", 0) or 0)
-        except Exception:
-            refresh_context = 0
-        if ckpt and os.path.isfile(ckpt):
-            self._east_ckpt = ckpt
-        if cfg and os.path.isfile(cfg):
-            self._east_cfg = cfg
-        if backend:
-            self._east_text_bank_version = backend
-        self._east_masked_refresh_context_override = max(0, int(refresh_context))
-        path = os.path.abspath(
-            os.path.expanduser(str(state.get("shared_adapter_path") or "").strip())
-        )
-        if path and os.path.isfile(path):
-            info = inspect_east_shared_adapter_bundle(path)
-            if bool(info.get("ok", False)):
-                self._east_category_adapter_path = path
-                return
-        self._east_category_adapter_path = ""
-        try:
-            self._persist_east_ui_state()
-        except Exception:
-            pass
 
-    def _persist_east_ui_state(self) -> None:
-        path = self._effective_east_shared_adapter_path()
-        ok, path_or_err = save_east_ui_state(
-            {
-                "shared_adapter_path": path,
-                "east_ckpt": str(self._east_ckpt or "").strip(),
-                "east_cfg": str(self._east_cfg or "").strip(),
-                "text_bank_backend": str(self._east_text_bank_version or "").strip(),
-                "masked_refresh_context_frames": int(
-                    getattr(self, "_east_masked_refresh_context_override", 0) or 0
-                ),
-            }
-        )
-        if not ok:
-            print(f"[EAST][WARN] Failed to save UI state: {path_or_err}")
 
-    def _effective_east_shared_adapter_path(self) -> str:
-        path = os.path.abspath(
-            os.path.expanduser(str(self._east_category_adapter_path or "").strip())
-        )
-        if path and os.path.isfile(path):
-            return path
-        return ""
 
-    def _selected_east_shared_adapter_info(self) -> Dict[str, Any]:
-        shared_path = self._effective_east_shared_adapter_path()
-        if not shared_path:
-            return {}
-        try:
-            info = inspect_east_shared_adapter_bundle(shared_path)
-        except Exception:
-            info = {}
-        return info if bool(info.get("ok", False)) else {}
 
-    def _east_refine_launch_summary(self) -> str:
-        shared_info = self._selected_east_shared_adapter_info()
-        if not shared_info:
-            return "Starting EAST refinement."
-        name = str(shared_info.get("display_name") or os.path.basename(str(self._east_category_adapter_path or "").strip()) or "shared adapter")
-        return f"Starting EAST refinement (shared adapter: {name})."
 
     def _current_query_policy_snapshot(self) -> Dict[str, Any]:
         cfg = self._assisted_cfg()
@@ -3949,17 +3234,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         }
 
     def _masked_refresh_context_frames(self) -> int:
-        raw = int(
-            getattr(self, "_east_masked_refresh_context_override", 0) or 0
+        raw = (
+            self.algo.get('masked_refresh_context_frames')
+            if isinstance(getattr(self, 'algo', None), dict)
+            else None
         )
-        if raw <= 0:
-            raw = (
-                self.algo.get("east_masked_refresh_context_frames")
-                if isinstance(getattr(self, "algo", None), dict)
-                else None
-            )
-        if raw in (None, ""):
-            raw = os.environ.get("EAST_MASKED_REFRESH_CONTEXT_FRAMES", "48")
+        if raw in (None, ''):
+            raw = os.environ.get('MASKED_REFRESH_CONTEXT_FRAMES', '48')
         try:
             value = int(raw)
         except Exception:
@@ -4125,568 +3406,15 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
         return windows
 
-    def _east_assets_features_dir(self) -> Optional[str]:
-        return self._correction_features_dir()
 
-    def _current_east_runtime_report(self) -> Optional[Dict[str, Any]]:
-        features_dir = self._east_assets_features_dir()
-        if not features_dir:
-            QMessageBox.information(
-                self,
-                "EAST Runtime",
-                "No EAST feature directory is available for the current video.",
-            )
-            return None
-        report = inspect_east_runtime_assets(features_dir)
-        if not bool(report.get("ok", False)):
-            reason = str(report.get("reason", "runtime_unavailable") or "runtime_unavailable")
-            QMessageBox.information(
-                self,
-                "EAST Runtime",
-                f"EAST runtime assets are not available yet ({reason}).",
-            )
-            return None
-        merged = dict(report)
-        merged.update(self._east_runtime_debug_context(report, features_dir=features_dir))
-        return merged
 
-    def _east_runtime_debug_report(self) -> Dict[str, Any]:
-        features_dir = self._east_assets_features_dir()
-        if features_dir:
-            report = inspect_east_runtime_assets(features_dir)
-        else:
-            fallback_dir = str(self._default_east_features_dir_for_video() or "").strip()
-            report = {
-                "ok": False,
-                "reason": "features_dir_missing",
-                "features_dir": os.path.abspath(fallback_dir) if fallback_dir else "",
-                "runtime_dir": (
-                    os.path.join(os.path.abspath(fallback_dir), "east_runtime")
-                    if fallback_dir
-                    else ""
-                ),
-            }
-        merged = dict(report or {})
-        merged.update(self._east_runtime_debug_context(merged, features_dir=features_dir))
-        return merged
 
-    def _inspect_east_runtime_assets(self) -> None:
-        report = self._east_runtime_debug_report()
-        shared_info = self._selected_east_shared_adapter_info()
-        query_info = self._current_query_policy_snapshot()
-        dlg = QDialog(self)
-        dlg.setWindowTitle("EAST Runtime Debug")
-        dlg.setMinimumSize(720, 560)
-        dlg.resize(860, 680)
-        outer = QVBoxLayout(dlg)
-        tabs = QTabWidget(dlg)
-        outer.addWidget(tabs, 1)
 
-        summary_scroll = QScrollArea(dlg)
-        summary_scroll.setWidgetResizable(True)
-        summary_scroll.setFrameShape(QFrame.NoFrame)
-        content = QWidget(summary_scroll)
-        root = QVBoxLayout(content)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
-        summary_scroll.setWidget(content)
-        tabs.addTab(summary_scroll, "Summary")
 
-        def _add_section(title: str, rows: List[tuple]) -> None:
-            box = QGroupBox(title, content)
-            form = QFormLayout(box)
-            form.setContentsMargins(10, 10, 10, 10)
-            form.setSpacing(8)
-            for label, value in rows:
-                lbl = QLabel(str(value), box)
-                lbl.setWordWrap(True)
-                lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                form.addRow(str(label), lbl)
-            root.addWidget(box)
 
-        _add_section(
-            "Runtime",
-            [
-                ("Runtime status", report.get("runtime_source_label") or "-"),
-                ("Runtime ready", "Yes" if report.get("runtime_available") else "No"),
-                ("Baseline source", report.get("baseline_source") or "-"),
-                ("Video ID", report.get("video_id") or "-"),
-                ("Features dir", report.get("features_dir") or "-"),
-                ("Runtime dir", report.get("runtime_dir") or "-"),
-                ("Segments", int(report.get("segment_count", 0) or 0)),
-                ("Classes", int(report.get("class_count", 0) or 0)),
-                ("Confirmed corrections", int(report.get("record_count", 0) or 0)),
-                ("Runtime dirty", "Yes" if report.get("runtime_dirty") else "No"),
-            ],
-        )
-        _add_section(
-            "Bootstrap State",
-            [
-                ("Features ready", "Yes" if report.get("features_ready") else "No"),
-                ("Bootstrap source", report.get("bootstrap_source") or "-"),
-                ("Bootstrap pending", "Yes" if report.get("bootstrap_pending") else "No"),
-                (
-                    "Bootstrap completed",
-                    "Yes" if report.get("bootstrap_completed") else "No",
-                ),
-                (
-                    "Bootstrap confirmed records",
-                    int(report.get("bootstrap_confirmed_count", 0) or 0),
-                ),
-                (
-                    "Current confirmed records",
-                    int(report.get("current_confirmed_record_count", 0) or 0),
-                ),
-                (
-                    "Bootstrap initialized at",
-                    report.get("bootstrap_initialized_at") or "-",
-                ),
-                (
-                    "Refresh deferred once",
-                    "Yes" if report.get("bootstrap_refresh_deferred") else "No",
-                ),
-                ("Status reason", report.get("runtime_status_reason") or "-"),
-            ],
-        )
-        _add_section(
-            "Learning State",
-            [
-                ("Locked segments", int(report.get("locked_segment_count", 0) or 0)),
-                (
-                    "Label text bank",
-                    (
-                        "Yes"
-                        if report.get("has_label_text_bank")
-                        else "No"
-                    )
-                    + (
-                        f" ({str(report.get('label_text_bank_backend') or '').strip()})"
-                        if str(report.get("label_text_bank_backend") or "").strip()
-                        else ""
-                    ),
-                ),
-                (
-                    "Online adapter",
-                    f"{'Yes' if report.get('has_online_adapter') else 'No'} "
-                    f"(step {int(report.get('online_step', 0) or 0)})",
-                ),
-                (
-                    "Label spans",
-                    f"+{int(report.get('online_positive_span_count', 0) or 0)} / "
-                    f"-{int(report.get('online_negative_span_count', 0) or 0)}",
-                ),
-                (
-                    "Ranking pairs",
-                    int(report.get("online_ranking_pair_count", 0) or 0),
-                ),
-                (
-                    "Boundary targets",
-                    int(report.get("online_boundary_supervision_count", 0) or 0),
-                ),
-                (
-                    "Model delta",
-                    f"{'Yes' if report.get('has_model_delta') else 'No'} "
-                    f"(step {int(report.get('model_delta_step', 0) or 0)})",
-                ),
-                ("Prototypes", int(report.get("prototype_count", 0) or 0)),
-                ("Transition pairs", int(report.get("transition_delta_pairs", 0) or 0)),
-                ("Confusion pairs", int(report.get("confusion_delta_pairs", 0) or 0)),
-            ],
-        )
-        _add_section(
-            "Query Policy",
-            [
-                ("Sort mode", query_info.get("sort_mode") or "query_score"),
-                (
-                    "Thresholds",
-                    f"Boundary >= {float(query_info.get('boundary_query_min', 0.0) or 0.0):.2f}, "
-                    f"Label >= {float(query_info.get('label_query_min', 0.0) or 0.0):.2f}",
-                ),
-                ("Queued review points", int(query_info.get("queue_count", 0) or 0)),
-                ("Boundary points", int(query_info.get("boundary_point_count", 0) or 0)),
-                ("Label points", int(query_info.get("label_point_count", 0) or 0)),
-                (
-                    "Avg query score",
-                    f"Boundary {float(query_info.get('boundary_query_avg', 0.0) or 0.0):.2f}, "
-                    f"Label {float(query_info.get('label_query_avg', 0.0) or 0.0):.2f}",
-                ),
-                (
-                    "Max query score",
-                    f"Boundary {float(query_info.get('boundary_query_max', 0.0) or 0.0):.2f}, "
-                    f"Label {float(query_info.get('label_query_max', 0.0) or 0.0):.2f}",
-                ),
-                (
-                    "Priority buckets",
-                    ", ".join(
-                        f"{key}:{int(val)}"
-                        for key, val in (query_info.get("priority_buckets") or {}).items()
-                    )
-                    or "-",
-                ),
-            ],
-        )
-        if shared_info:
-            _add_section(
-                "Selected Shared Adapter",
-                [
-                    ("Name", shared_info.get("display_name") or "-"),
-                    ("Members", int(shared_info.get("member_count", 0) or 0)),
-                    (
-                        "Label text bank",
-                        (
-                            "Yes"
-                            if shared_info.get("has_label_text_bank")
-                            else "No"
-                        )
-                        + (
-                            f" ({str(shared_info.get('label_text_bank_backend') or '').strip()})"
-                            if str(shared_info.get("label_text_bank_backend") or "").strip()
-                            else ""
-                        ),
-                    ),
-                    ("Online adapter", "Yes" if shared_info.get("has_online_adapter") else "No"),
-                    ("Online step", int(shared_info.get("online_step", 0) or 0)),
-                    ("Ranking pairs", int(shared_info.get("online_ranking_pair_count", 0) or 0)),
-                    ("Prototypes", int(shared_info.get("prototype_count", 0) or 0)),
-                    ("Transition pairs", int(shared_info.get("transition_delta_pairs", 0) or 0)),
-                    ("Confusion pairs", int(shared_info.get("confusion_delta_pairs", 0) or 0)),
-                ],
-            )
 
-        action_counts = dict(report.get("action_counts") or {})
-        if action_counts:
-            box_actions = QGroupBox("Confirmed Action Counts", content)
-            form_actions = QFormLayout(box_actions)
-            form_actions.setContentsMargins(10, 10, 10, 10)
-            for key in sorted(action_counts.keys()):
-                form_actions.addRow(str(key), QLabel(str(int(action_counts.get(key, 0) or 0)), box_actions))
-            root.addWidget(box_actions)
 
-        root.addStretch(1)
 
-        raw_page = QWidget(dlg)
-        raw_layout = QVBoxLayout(raw_page)
-        raw_layout.setContentsMargins(0, 0, 0, 0)
-        raw_text = QPlainTextEdit(raw_page)
-        raw_text.setReadOnly(True)
-        raw_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        detail_payload = {
-            "runtime": report,
-            "selected_shared_adapter": shared_info,
-            "query_policy": query_info,
-            "advanced": {
-                "runtime_files": {
-                    "has_boundary_score": bool(report.get("has_boundary_score")),
-                    "has_seg_embeddings": bool(report.get("has_seg_embeddings")),
-                    "has_label_scores": bool(report.get("has_label_scores")),
-                    "has_transition_matrix": bool(report.get("has_transition_matrix")),
-                    "has_runtime_prototype": bool(report.get("has_runtime_prototype")),
-                    "text_table_shape": report.get("text_table_shape") or (0, 0),
-                },
-                "shared_adapter_path": str(self._east_category_adapter_path or ""),
-                "action_counts": action_counts,
-            },
-        }
-        try:
-            raw_text.setPlainText(
-                json.dumps(
-                    detail_payload,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-            )
-        except Exception:
-            raw_text.setPlainText(str(detail_payload))
-        raw_layout.addWidget(raw_text)
-        tabs.addTab(raw_page, "Raw JSON")
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dlg)
-        btn_export_report = buttons.addButton("Export Runtime Report...", QDialogButtonBox.ActionRole)
-        btn_export_shared = buttons.addButton("Export Shared Adapter...", QDialogButtonBox.ActionRole)
-        buttons.rejected.connect(dlg.reject)
-        buttons.accepted.connect(dlg.accept)
-        btn_export_report.clicked.connect(self._export_east_runtime_report)
-        btn_export_shared.clicked.connect(self._export_current_east_shared_adapter)
-        outer.addWidget(buttons)
-        dlg.exec_()
-
-    def _export_east_runtime_report(self) -> None:
-        report = self._current_east_runtime_report()
-        if not report:
-            return
-        default_name = (
-            str(report.get("video_id") or "east_runtime") + ".runtime_report.json"
-        )
-        fp, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export EAST Runtime Report",
-            os.path.join(os.getcwd(), default_name),
-            "JSON Files (*.json)",
-        )
-        if not fp:
-            return
-        export_east_runtime_report(str(report.get("features_dir") or ""), fp)
-        shared_path = self._effective_east_shared_adapter_path()
-        query_info = self._current_query_policy_snapshot()
-        if shared_path:
-            try:
-                shared_info = inspect_east_shared_adapter_bundle(shared_path)
-            except Exception:
-                shared_info = {}
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                if isinstance(payload, dict):
-                    payload["selected_shared_adapter_path"] = shared_path
-                    payload["selected_shared_adapter"] = shared_info
-                    payload["query_policy"] = query_info
-                    with open(fp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                pass
-        elif query_info:
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                if isinstance(payload, dict):
-                    payload["query_policy"] = query_info
-                    with open(fp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                pass
-        self._set_status(f"Exported EAST runtime report: {os.path.basename(fp)}")
-
-    def _export_current_east_shared_adapter(self) -> None:
-        report = self._current_east_runtime_report()
-        if not report:
-            return
-        if not bool(report.get("has_online_adapter")) and not bool(report.get("has_model_delta")):
-            QMessageBox.information(
-                self,
-                "EAST Shared Adapter",
-                "The current runtime does not contain an online adapter or model delta yet.",
-            )
-            return
-        default_name = str(report.get("video_id") or "east_shared_adapter") + ".pt"
-        fp, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export EAST Shared Adapter",
-            os.path.join(os.getcwd(), default_name),
-            "PyTorch Files (*.pt *.pth)",
-        )
-        if not fp:
-            return
-        category, ok = QInputDialog.getText(
-            self,
-            "Shared Adapter Category",
-            "Category name (optional):",
-            text="action_segmentation",
-        )
-        if not ok:
-            return
-        label_bank = list(report.get("classes") or [])
-        out = export_runtime_as_shared_adapter(
-            str(report.get("features_dir") or ""),
-            fp,
-            category=str(category or "").strip(),
-            label_bank=label_bank,
-        )
-        self._set_status(f"Exported EAST shared adapter: {os.path.basename(out)}")
-
-    def _select_east_shared_adapter(self) -> None:
-        fp, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select EAST Shared Adapter",
-            "",
-            "PyTorch Files (*.pt *.pth)",
-        )
-        if not fp:
-            return
-        info = inspect_east_shared_adapter_bundle(fp)
-        if not bool(info.get("ok", False)):
-            QMessageBox.warning(
-                self,
-                "EAST Shared Adapter",
-                "The selected file is not a valid EAST shared adapter bundle.",
-            )
-            return
-        self._east_category_adapter_path = fp
-        self._persist_east_ui_state()
-        self._set_status(
-            f"Selected EAST shared adapter: {info.get('display_name') or os.path.basename(fp)}"
-        )
-
-    def _clear_east_shared_adapter(self) -> None:
-        if not str(self._east_category_adapter_path or "").strip():
-            self._set_status("No EAST shared adapter is currently selected.")
-            return
-        self._east_category_adapter_path = ""
-        self._persist_east_ui_state()
-        self._set_status("Cleared selected EAST shared adapter.")
-
-    def _open_east_setup_dialog(self) -> None:
-        self._refresh_east_backend_defaults()
-        dlg = QDialog(self)
-        dlg.setWindowTitle("EAST Setup")
-        dlg.setMinimumWidth(640)
-        outer = QVBoxLayout(dlg)
-
-        def _path_row(initial_text: str, browse_title: str, filt: str) -> Tuple[QWidget, QLineEdit, QPushButton]:
-            row = QWidget(dlg)
-            layout = QHBoxLayout(row)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(6)
-            edit = QLineEdit(row)
-            edit.setText(str(initial_text or "").strip())
-            btn = QPushButton("Browse...", row)
-            btn.clicked.connect(
-                lambda: self._browse_east_setup_path(edit, browse_title, filt)
-            )
-            layout.addWidget(edit, 1)
-            layout.addWidget(btn, 0)
-            return row, edit, btn
-
-        group_model = QGroupBox("Model Assets", dlg)
-        form_model = QFormLayout(group_model)
-        row_ckpt, edit_ckpt, _ = _path_row(
-            str(self._east_ckpt or "").strip(),
-            "Choose EAST checkpoint",
-            "PyTorch Models (*.pth *.pt *.ckpt)",
-        )
-        row_cfg, edit_cfg, _ = _path_row(
-            str(self._east_cfg or "").strip(),
-            "Choose EAST config",
-            "Config Files (*.py *.yaml *.yml)",
-        )
-        form_model.addRow("Checkpoint", row_ckpt)
-        form_model.addRow("Config", row_cfg)
-        outer.addWidget(group_model)
-
-        group_alignment = QGroupBox("Online Alignment", dlg)
-        form_alignment = QFormLayout(group_alignment)
-        combo_backend = QComboBox(group_alignment)
-        for title, value in self._east_text_bank_backend_items():
-            combo_backend.addItem(title, value)
-        idx_backend = combo_backend.findData(
-            str(self._east_text_bank_version or "auto").strip().lower() or "auto"
-        )
-        combo_backend.setCurrentIndex(idx_backend if idx_backend >= 0 else 0)
-        row_shared = QWidget(group_alignment)
-        row_shared_l = QHBoxLayout(row_shared)
-        row_shared_l.setContentsMargins(0, 0, 0, 0)
-        row_shared_l.setSpacing(6)
-        edit_shared = QLineEdit(row_shared)
-        edit_shared.setReadOnly(True)
-        edit_shared.setText(str(self._effective_east_shared_adapter_path() or "").strip())
-        btn_shared_select = QPushButton("Select...", row_shared)
-        btn_shared_clear = QPushButton("Clear", row_shared)
-
-        def _select_shared() -> None:
-            fp, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select EAST Shared Adapter",
-                "",
-                "PyTorch Files (*.pt *.pth)",
-            )
-            if not fp:
-                return
-            info = inspect_east_shared_adapter_bundle(fp)
-            if not bool(info.get("ok", False)):
-                QMessageBox.warning(
-                    dlg,
-                    "EAST Shared Adapter",
-                    "The selected file is not a valid EAST shared adapter bundle.",
-                )
-                return
-            edit_shared.setText(os.path.abspath(fp))
-
-        btn_shared_select.clicked.connect(_select_shared)
-        btn_shared_clear.clicked.connect(lambda: edit_shared.setText(""))
-        row_shared_l.addWidget(edit_shared, 1)
-        row_shared_l.addWidget(btn_shared_select, 0)
-        row_shared_l.addWidget(btn_shared_clear, 0)
-        form_alignment.addRow("Label text backend", combo_backend)
-        form_alignment.addRow("Shared adapter", row_shared)
-        outer.addWidget(group_alignment)
-
-        group_refresh = QGroupBox("Refresh", dlg)
-        form_refresh = QFormLayout(group_refresh)
-        sp_context = QSpinBox(group_refresh)
-        sp_context.setRange(8, 512)
-        sp_context.setValue(int(self._masked_refresh_context_frames()))
-        form_refresh.addRow("Masked refresh context (frames)", sp_context)
-        outer.addWidget(group_refresh)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
-            parent=dlg,
-        )
-        btn_reset = buttons.addButton(
-            "Reset to defaults",
-            QDialogButtonBox.ResetRole,
-        )
-
-        def _reset_defaults() -> None:
-            try:
-                load_feature_env_defaults(repo_root=self._root_dir)
-            except Exception:
-                pass
-            edit_ckpt.setText(str(os.environ.get("EAST_CKPT", "") or "").strip())
-            edit_cfg.setText(str(os.environ.get("EAST_CFG", "") or "").strip())
-            idx = combo_backend.findData("auto")
-            combo_backend.setCurrentIndex(idx if idx >= 0 else 0)
-            sp_context.setValue(48)
-            edit_shared.setText("")
-
-        btn_reset.clicked.connect(_reset_defaults)
-        buttons.rejected.connect(dlg.reject)
-        buttons.accepted.connect(dlg.accept)
-        outer.addWidget(buttons)
-
-        while True:
-            if dlg.exec_() != QDialog.Accepted:
-                return
-            ckpt = os.path.abspath(os.path.expanduser(str(edit_ckpt.text() or "").strip()))
-            cfg = os.path.abspath(os.path.expanduser(str(edit_cfg.text() or "").strip()))
-            shared = os.path.abspath(os.path.expanduser(str(edit_shared.text() or "").strip()))
-            if ckpt and not os.path.isfile(ckpt):
-                QMessageBox.warning(dlg, "Invalid checkpoint", "Selected EAST checkpoint does not exist.")
-                continue
-            if cfg and not os.path.isfile(cfg):
-                QMessageBox.warning(dlg, "Invalid config", "Selected EAST config does not exist.")
-                continue
-            if shared:
-                info = inspect_east_shared_adapter_bundle(shared)
-                if not bool(info.get("ok", False)):
-                    QMessageBox.warning(
-                        dlg,
-                        "Invalid shared adapter",
-                        "Selected shared adapter is not a valid EAST shared adapter bundle.",
-                    )
-                    continue
-            self._east_ckpt = ckpt
-            self._east_cfg = cfg
-            self._east_text_bank_version = str(
-                combo_backend.currentData() or "auto"
-            ).strip() or "auto"
-            self._east_masked_refresh_context_override = int(sp_context.value())
-            self._east_category_adapter_path = shared
-            self._persist_east_ui_state()
-            self._set_status("Updated EAST setup.")
-            return
-
-    def _browse_east_setup_path(self, line_edit: QLineEdit, title: str, filt: str) -> None:
-        start_dir = ""
-        try:
-            existing = os.path.abspath(os.path.expanduser(str(line_edit.text() or "").strip()))
-            if existing:
-                start_dir = existing if os.path.isdir(existing) else os.path.dirname(existing)
-        except Exception:
-            start_dir = ""
-        path, _ = QFileDialog.getOpenFileName(self, title, start_dir, filt)
-        if path:
-            line_edit.setText(os.path.abspath(path))
 
     def _guess_open_session_annotation_path(self, video_path: str) -> str:
         path = os.path.abspath(os.path.expanduser(str(video_path or "").strip()))
@@ -4733,29 +3461,15 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         return ""
 
-    def _east_setup_summary_text(self) -> str:
-        ckpt = str(getattr(self, "_east_ckpt", "") or "").strip()
-        cfg = str(getattr(self, "_east_cfg", "") or "").strip()
-        shared = str(self._effective_east_shared_adapter_path() or "").strip()
-        backend = str(getattr(self, "_east_text_bank_version", "auto") or "auto").strip()
-        ckpt_name = os.path.basename(ckpt) if ckpt else "Not set"
-        cfg_name = os.path.basename(cfg) if cfg else "Not set"
-        shared_name = os.path.basename(shared) if shared else "None"
-        return (
-            f"Checkpoint: {ckpt_name}\n"
-            f"Config: {cfg_name}\n"
-            f"Label text backend: {backend}\n"
-            f"Shared adapter: {shared_name}"
-        )
 
     def _open_session_wizard(self) -> None:
         dlg = QDialog(self)
-        dlg.setWindowTitle("Open Session")
+        dlg.setWindowTitle('Open Session')
         dlg.setMinimumWidth(760)
         outer = QVBoxLayout(dlg)
 
         intro = QLabel(
-            "Load a video and optionally import nearby labels and annotations in one flow."
+            'Load a video and optionally import nearby labels and annotations in one flow.'
         )
         intro.setWordWrap(True)
         outer.addWidget(intro)
@@ -4772,37 +3486,40 @@ class ActionWindow(FrameControlMixin, QWidget):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(6)
             edit = QLineEdit(row)
-            edit.setText(str(initial_text or "").strip())
-            btn_browse = QPushButton("Browse...", row)
+            edit.setText(str(initial_text or '').strip())
+            btn_browse = QPushButton('Browse...', row)
 
             def _browse() -> None:
-                self._browse_east_setup_path(edit, browse_title, filt)
-                if on_browse is not None:
-                    on_browse()
+                start_dir = str(edit.text() or '').strip() or os.getcwd()
+                path, _ = QFileDialog.getOpenFileName(dlg, browse_title, start_dir, filt)
+                if path:
+                    edit.setText(path)
+                    if on_browse is not None:
+                        on_browse()
 
             btn_browse.clicked.connect(_browse)
             layout.addWidget(edit, 1)
             layout.addWidget(btn_browse, 0)
             return row, edit
 
-        group_assets = QGroupBox("Session Assets", dlg)
+        group_assets = QGroupBox('Session Assets', dlg)
         form_assets = QFormLayout(group_assets)
         row_labels, edit_labels = _path_row(
-            str(self._current_label_bank_source_path() or "").strip(),
-            "Choose label map (TXT)",
-            "Text Files (*.txt)",
+            str(self._current_label_bank_source_path() or '').strip(),
+            'Choose label map (TXT)',
+            'Text Files (*.txt)',
         )
         row_json, edit_json = _path_row(
-            str(getattr(self, "current_annotation_path", "") or "").strip(),
-            "Choose annotations JSON",
-            "JSON Files (*.json)",
+            str(getattr(self, 'current_annotation_path', '') or '').strip(),
+            'Choose annotations JSON',
+            'JSON Files (*.json)',
         )
-        cb_labels = QCheckBox("Import labels from TXT", group_assets)
-        cb_json = QCheckBox("Import annotations JSON", group_assets)
-        btn_detect = QPushButton("Autofill Nearby Files", group_assets)
+        cb_labels = QCheckBox('Import labels from TXT', group_assets)
+        cb_json = QCheckBox('Import annotations JSON', group_assets)
+        btn_detect = QPushButton('Autofill Nearby Files', group_assets)
 
         def _autofill_from_video(force: bool = False) -> None:
-            video_fp = os.path.abspath(os.path.expanduser(str(edit_video.text() or "").strip()))
+            video_fp = os.path.abspath(os.path.expanduser(str(edit_video.text() or '').strip()))
             if not video_fp or not os.path.isfile(video_fp):
                 return
             label_fp = resolve_label_source(
@@ -4810,39 +3527,27 @@ class ActionWindow(FrameControlMixin, QWidget):
                 repo_root=self._root_dir,
             )
             ann_fp = self._guess_open_session_annotation_path(video_fp)
-            if force or not str(edit_labels.text() or "").strip():
-                edit_labels.setText(str(label_fp or ""))
-            if force or not str(edit_json.text() or "").strip():
-                edit_json.setText(str(ann_fp or ""))
-            cb_labels.setChecked(bool(str(edit_labels.text() or "").strip()))
-            cb_json.setChecked(bool(str(edit_json.text() or "").strip()))
+            if force or not str(edit_labels.text() or '').strip():
+                edit_labels.setText(str(label_fp or ''))
+            if force or not str(edit_json.text() or '').strip():
+                edit_json.setText(str(ann_fp or ''))
+            cb_labels.setChecked(bool(str(edit_labels.text() or '').strip()))
+            cb_json.setChecked(bool(str(edit_json.text() or '').strip()))
 
         row_video, edit_video = _path_row(
-            str(getattr(self, "video_path", "") or "").strip(),
-            "Choose Video",
-            "Video Files (*.mp4 *.avi *.mov *.mkv)",
+            str(getattr(self, 'video_path', '') or '').strip(),
+            'Choose Video',
+            'Video Files (*.mp4 *.avi *.mov *.mkv)',
             on_browse=lambda: _autofill_from_video(force=True),
         )
-        form_assets.addRow("Video", row_video)
-        form_assets.addRow("", btn_detect)
-        form_assets.addRow("Labels", row_labels)
-        form_assets.addRow("", cb_labels)
-        form_assets.addRow("Annotations", row_json)
-        form_assets.addRow("", cb_json)
+        form_assets.addRow('Video', row_video)
+        form_assets.addRow('', btn_detect)
+        form_assets.addRow('Labels', row_labels)
+        form_assets.addRow('', cb_labels)
+        form_assets.addRow('Annotations', row_json)
+        form_assets.addRow('', cb_json)
         btn_detect.clicked.connect(lambda: _autofill_from_video(force=True))
         outer.addWidget(group_assets)
-
-        group_model = QGroupBox("Current EAST Setup", dlg)
-        model_layout = QVBoxLayout(group_model)
-        lbl_model = QLabel(group_model)
-        lbl_model.setWordWrap(True)
-        lbl_model.setText(self._east_setup_summary_text())
-        btn_model = QPushButton("Configure EAST...", group_model)
-        btn_model.clicked.connect(self._open_east_setup_dialog)
-        btn_model.clicked.connect(lambda: lbl_model.setText(self._east_setup_summary_text()))
-        model_layout.addWidget(lbl_model)
-        model_layout.addWidget(btn_model, 0, Qt.AlignLeft)
-        outer.addWidget(group_model)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
@@ -4857,19 +3562,19 @@ class ActionWindow(FrameControlMixin, QWidget):
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        video_fp = os.path.abspath(os.path.expanduser(str(edit_video.text() or "").strip()))
-        label_fp = os.path.abspath(os.path.expanduser(str(edit_labels.text() or "").strip()))
-        ann_fp = os.path.abspath(os.path.expanduser(str(edit_json.text() or "").strip()))
+        video_fp = os.path.abspath(os.path.expanduser(str(edit_video.text() or '').strip()))
+        label_fp = os.path.abspath(os.path.expanduser(str(edit_labels.text() or '').strip()))
+        ann_fp = os.path.abspath(os.path.expanduser(str(edit_json.text() or '').strip()))
         if not video_fp or not os.path.isfile(video_fp):
-            QMessageBox.warning(self, "Open Session", "Choose a valid video file.")
+            QMessageBox.warning(self, 'Open Session', 'Choose a valid video file.')
             return
         if cb_labels.isChecked() and label_fp and not os.path.isfile(label_fp):
-            QMessageBox.warning(self, "Open Session", "The selected label map does not exist.")
+            QMessageBox.warning(self, 'Open Session', 'The selected label map does not exist.')
             return
         if cb_json.isChecked() and ann_fp and not os.path.isfile(ann_fp):
-            QMessageBox.warning(self, "Open Session", "The selected annotation JSON does not exist.")
+            QMessageBox.warning(self, 'Open Session', 'The selected annotation JSON does not exist.')
             return
-        if not self._prompt_save_if_dirty(context="opening a new session"):
+        if not self._prompt_save_if_dirty(context='opening a new session'):
             return
         if not self._load_primary_video(video_fp):
             return
@@ -4877,54 +3582,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._import_label_map_txt(label_fp)
         if cb_json.isChecked() and ann_fp:
             self._load_json_annotations(path=ann_fp)
-        self._set_status(f"Opened session: {os.path.basename(video_fp)}")
+        self._set_status(f'Opened session: {os.path.basename(video_fp)}')
 
-    def _consolidate_east_shared_adapter(self) -> None:
-        root_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Select Root Folder Containing EAST Runtime Assets",
-            os.getcwd(),
-        )
-        if not root_dir:
-            return
-        default_name = "east_shared_consolidated.pt"
-        fp, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Consolidated EAST Shared Adapter",
-            os.path.join(os.getcwd(), default_name),
-            "PyTorch Files (*.pt *.pth)",
-        )
-        if not fp:
-            return
-        category, ok = QInputDialog.getText(
-            self,
-            "Consolidated Adapter Category",
-            "Category name (optional):",
-            text="action_segmentation",
-        )
-        if not ok:
-            return
-        result = consolidate_east_shared_adapter(
-            root_dir,
-            fp,
-            category=str(category or "").strip(),
-        )
-        if not bool(result.get("ok", False)):
-            QMessageBox.information(
-                self,
-                "EAST Shared Adapter",
-                f"Consolidation skipped: {result.get('reason') or 'unknown error'}.",
-            )
-            return
-        self._east_category_adapter_path = str(result.get("output_path") or fp)
-        self._persist_east_ui_state()
-        self._set_status(
-            "Consolidated EAST shared adapter ready "
-            f"({int(result.get('runtime_count', 0) or 0)} runtimes, "
-            f"{int(result.get('label_count', 0) or 0)} labels, "
-            f"online={'yes' if result.get('has_online_adapter') else 'no'}, "
-            f"delta={'yes' if result.get('has_model_delta') else 'no'})."
-        )
 
     def _apply_trim_cut_op(self, op: Dict[str, Any], reverse: bool = False) -> bool:
         if not isinstance(op, dict):
@@ -6006,10 +4665,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.combo_actions.setEnabled(True)
         except Exception:
             pass
-        try:
-            self.btn_auto_label.setEnabled(True)
-        except Exception:
-            pass
         if not on:
             try:
                 self.btn_mag.setChecked(False)
@@ -6135,56 +4790,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._set_status(f"{feature_name} failed to initialize.")
             return False
 
-    def _ensure_east_runtime_ready(
-        self,
-        *,
-        feature_name: str = "EAST refinement",
-        unavailable_status: str = "",
-        show_dialog: bool = True,
-    ) -> bool:
-        if not self._ensure_python_modules_available(
-            ("torch", "mmengine"),
-            feature_name=feature_name,
-            install_hint=(
-                "Install the optional EAST runtime dependencies, for example: "
-                "pip install torch mmengine"
-            ),
-            unavailable_status=(
-                unavailable_status
-                or (
-                    f"{feature_name} is unavailable until the EAST runtime dependencies are installed."
-                )
-            ),
-            show_dialog=show_dialog,
-        ):
-            return False
-        try:
-            from tools.east.east_model_infer import (
-                _ensure_east_importable,
-                resolve_east_repo_root,
-            )
-
-            east_root = resolve_east_repo_root()
-            _ensure_east_importable(east_root)
-            return True
-        except Exception as ex:
-            message = (
-                f"{feature_name} requires a complete EAST runtime checkout.\n\n"
-                f"Details: {ex}\n\n"
-                "Expected one of these setups:\n"
-                "1. Set EAST_REPO_ROOT to a full EAST-main checkout that contains opentad/ and the nms shim.\n"
-                "2. Place a full EAST-main checkout at external/EAST-main.\n\n"
-                "A folder that only contains configs/ and pretrained/ is not enough."
-            )
-            if show_dialog:
-                QMessageBox.warning(self, f"{feature_name} unavailable", message)
-            self._set_status(
-                unavailable_status
-                or (
-                    f"{feature_name} is unavailable until a full EAST-main checkout is configured."
-                )
-            )
-            return False
 
     def _on_feat_progress_message(self, line: str):
         text = str(line or "").strip()
@@ -6328,41 +4933,30 @@ class ActionWindow(FrameControlMixin, QWidget):
         # Defer extraction to a background worker; caller will start the thread.
         return feat_dir
 
-    def _default_east_features_dir_for_video(self) -> Optional[str]:
-        if not getattr(self, "video_path", None):
-            return None
-        base = os.path.splitext(os.path.basename(self.video_path))[0]
-        return os.path.join(os.path.dirname(self.video_path), f"{base}_features_east")
 
-    def _ensure_east_features_for_current_video(self) -> Optional[str]:
-        feat_dir = self._default_east_features_dir_for_video()
-        if not feat_dir:
-            return None
-        os.makedirs(feat_dir, exist_ok=True)
-        return feat_dir
 
-    def _east_label_bank(self) -> List[str]:
-        labels: List[str] = []
-        for label in getattr(self, "labels", []) or []:
-            name = str(getattr(label, "name", "") or "").strip()
-            if name and name not in labels:
-                labels.append(name)
-        return labels
 
     def _current_label_bank_source_path(self) -> str:
         path = os.path.abspath(
-            os.path.expanduser(str(getattr(self, "_action_label_bank_source", "") or "").strip())
+            os.path.expanduser(str(getattr(self, '_action_label_bank_source', '') or '').strip())
         )
         if not path or not os.path.isfile(path):
-            return ""
+            return ''
         try:
-            current = list(self._east_label_bank())
+            current = [
+                str(lb.name).strip()
+                for lb in sorted(
+                    self.labels,
+                    key=lambda lb: int(getattr(lb, 'id', 0) or 0),
+                )
+                if str(lb.name).strip() and not is_extra_label(str(lb.name).strip())
+            ]
             source_names = load_label_names(path)
         except Exception:
-            return ""
+            return ''
         if current and source_names and list(source_names) == current:
             return path
-        return ""
+        return ''
 
     def _write_label_bank_txt(
         self,
@@ -6371,15 +4965,26 @@ class ActionWindow(FrameControlMixin, QWidget):
         file_name: str,
         labels: Optional[List[str]] = None,
     ) -> Optional[str]:
-        names = [str(x).strip() for x in (labels or self._east_label_bank()) if str(x).strip()]
+        if labels is None:
+            raw_names = [
+                str(lb.name).strip()
+                for lb in sorted(
+                    self.labels,
+                    key=lambda lb: int(getattr(lb, 'id', 0) or 0),
+                )
+            ]
+        else:
+            raw_names = [str(x).strip() for x in labels]
+        names = [name for name in raw_names if name and not is_extra_label(name)]
         if not names:
             return None
         try:
             os.makedirs(target_dir, exist_ok=True)
             path = os.path.join(target_dir, file_name)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 for name in names:
-                    f.write(f"{name}\n")
+                    f.write(name)
+                    f.write('\n')
             return path
         except Exception:
             return None
@@ -6420,97 +5025,11 @@ class ActionWindow(FrameControlMixin, QWidget):
         QMessageBox.warning(self, missing_title, missing_text)
         return None
 
-    def _east_text_bank_backend_items(self) -> List[Tuple[str, str]]:
-        return [
-            ("Auto", "auto"),
-            ("MobileCLIP / CLIP", "mobileclip"),
-            ("SentenceTransformer", "sentence_transformers"),
-            ("Lexical fallback", "hashed_lexical"),
-        ]
 
-    def _refresh_east_backend_defaults(self) -> None:
-        try:
-            load_feature_env_defaults(repo_root=self._root_dir)
-        except Exception:
-            pass
-        env_ckpt = str(os.environ.get("EAST_CKPT", "") or "").strip()
-        env_cfg = str(os.environ.get("EAST_CFG", "") or "").strip()
-        env_text_bank = str(
-            os.environ.get("EAST_TEXT_BANK_BACKEND")
-            or os.environ.get("EAST_TEXT_BANK_VERSION", "auto")
-            or "auto"
-        ).strip()
-        if env_ckpt and (
-            (not str(self._east_ckpt or "").strip()) or (not os.path.isfile(self._east_ckpt))
-        ):
-            self._east_ckpt = env_ckpt
-        if env_cfg and (
-            (not str(self._east_cfg or "").strip()) or (not os.path.isfile(self._east_cfg))
-        ):
-            self._east_cfg = env_cfg
-        if env_text_bank:
-            self._east_text_bank_version = env_text_bank
 
-    def _east_feature_meta_backbone(self, features_dir: str) -> str:
-        meta = self._load_feature_meta(features_dir)
-        candidates = [
-            meta.get("source"),
-            meta.get("backbone"),
-            meta.get("feature_backbone_version"),
-        ]
-        for item in candidates:
-            text = str(item or "").strip()
-            if text:
-                return text
-        if meta.get("east_cfg") or meta.get("east_ckpt"):
-            return "east_backbone"
-        return ""
 
-    def _east_features_compatible(self, features_dir: str) -> bool:
-        tag = self._east_feature_meta_backbone(features_dir).strip().lower()
-        if not tag:
-            return False
-        return any(
-            token in tag
-            for token in (
-                "east",
-                "videomae",
-                "video_mae",
-            )
-        )
 
-    def _ensure_east_model_paths(self) -> bool:
-        self._refresh_east_backend_defaults()
-        ckpt = str(self._east_ckpt or "").strip()
-        cfg = str(self._east_cfg or "").strip()
-        if not ckpt or not os.path.isfile(ckpt):
-            ckpt, _ = QFileDialog.getOpenFileName(
-                self, "Choose EAST checkpoint", "", "PyTorch Models (*.pth *.pt)"
-            )
-            if not ckpt:
-                return False
-            self._east_ckpt = ckpt
-        if not cfg or not os.path.isfile(cfg):
-            cfg, _ = QFileDialog.getOpenFileName(
-                self, "Choose EAST config", "", "Config Files (*.py *.yaml *.yml)"
-            )
-            if not cfg:
-                return False
-            self._east_cfg = cfg
-        try:
-            self._persist_east_ui_state()
-        except Exception:
-            pass
-        return True
 
-    def _prepare_east_labels_file(self, features_dir: str) -> Optional[str]:
-        return self._resolve_action_label_bank_path(
-            features_dir,
-            generated_file_name="east_labels.txt",
-            dialog_title="Choose label bank (TXT)",
-            missing_title="Missing labels",
-            missing_text="EAST refinement requires a label bank or current action labels.",
-        )
 
     def _feature_layout_hint(self, features_dir: str) -> str:
         """
@@ -6612,35 +5131,28 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _apply_psr_controls(self, is_psr: bool):
         widgets = [
-            getattr(self, "btn_auto_label", None),
-            getattr(self, "btn_auto_label_asot", None),
-            getattr(self, "btn_mag", None),
-            getattr(self, "btn_extra", None),
-            getattr(self, "btn_assisted", None),
-            getattr(self, "lbl_interaction", None),
-            getattr(self, "combo_interaction", None),
-            getattr(self, "lbl_interaction_status", None),
+            getattr(self, 'btn_auto_label_asot', None),
+            getattr(self, 'btn_mag', None),
+            getattr(self, 'btn_extra', None),
+            getattr(self, 'btn_assisted', None),
+            getattr(self, 'lbl_interaction', None),
+            getattr(self, 'combo_interaction', None),
+            getattr(self, 'lbl_interaction_status', None),
         ]
         for w in widgets:
             if w is not None:
                 w.setVisible(not is_psr)
-        if getattr(self, "lbl_mode", None):
-            self.lbl_mode.setVisible(not is_psr)
-        if getattr(self, "combo_mode", None):
-            if is_psr:
-                try:
-                    self.combo_mode.setCurrentText("Coarse")
-                except Exception:
-                    pass
-            self.combo_mode.setVisible(not is_psr)
-        self._apply_psr_action_dropdown(is_psr)
-        self._apply_psr_asr_panel(is_psr)
-        self._apply_psr_left_panel(is_psr)
-        self._apply_psr_timeline(is_psr)
-        self._update_phase_panel_visibility()
+        for widget in (
+            getattr(self, 'btn_export_state_json', None),
+            getattr(self, 'btn_export_components', None),
+            getattr(self, 'btn_state_rules', None),
+            getattr(self, 'btn_psr_rules', None),
+        ):
+            if widget is not None:
+                widget.setVisible(bool(is_psr))
 
     def _apply_psr_action_dropdown(self, is_psr: bool) -> None:
-        combo = getattr(self, "combo_actions", None)
+        combo = getattr(self, 'combo_actions', None)
         if combo is None:
             return
         try:
@@ -6649,73 +5161,21 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         if is_psr:
             hidden = {
-                "Export JSON...",
-                "Export JSON (selected views to folders)...",
-                "Export to Seed Dataset...",
-                "Import label map (TXT)...",
-                "Export label map (TXT)...",
-                "ASOT: Build Label Remap...",
-                "Batch Pre-label...",
-                "EAST Setup...",
-                "EAST: Finalize Current Video",
-                "EAST: Inspect Runtime Assets",
-                "EAST: Export Runtime Report...",
-                "EAST: Export Shared Adapter...",
-                "EAST: Select Shared Adapter...",
-                "EAST: Clear Shared Adapter",
-                "EAST: Consolidate Shared Adapter...",
-                "Transcript: Open Workspace",
-                "Transcript Audio: Attach External Audio...",
-                "Transcript Audio: Set Audio Offset (ms)...",
-                "Transcript: Quick Generate / Import...",
+                'Export JSON...',
+                'Export JSON (selected views to folders)...',
+                'Export to Seed Dataset...',
+                'Import label map (TXT)...',
+                'Export label map (TXT)...',
+                'ASOT: Build Label Remap...',
+                'Batch Pre-label...',
+                'Transcript: Open Workspace',
+                'Transcript Audio: Attach External Audio...',
+                'Transcript Audio: Set Audio Offset (ms)...',
+                'Transcript: Quick Generate / Import...',
             }
         else:
-            hidden = {
-                "Assembly State: Load Components...",
-                "Assembly State: Save Components...",
-                "Assembly State: Load Rules...",
-                "Assembly State: Load State JSON...",
-                "Assembly State: Export State JSON...",
-            }
-        items = ["Choose action..."]
-        headers: Set[str] = set()
-        for title, group_items in list(getattr(self, "_action_groups", [])):
-            visible_items = [item for item in group_items if item not in hidden]
-            if not visible_items:
-                continue
-            header = f"[{title}]"
-            headers.add(header)
-            items.append(header)
-            items.extend(visible_items)
-        current_items = [combo.itemText(i) for i in range(combo.count())]
-        if current_items == items and headers == set(
-            getattr(self, "_action_section_headers", set())
-        ):
-            return
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItems(items)
-        self._action_section_headers = set(headers)
-        model = combo.model()
-        for i in range(combo.count()):
-            item_text = combo.itemText(i)
-            try:
-                model_item = model.item(i)
-            except Exception:
-                model_item = None
-            if model_item is None:
-                continue
-            if item_text in headers:
-                model_item.setEnabled(False)
-                model_item.setForeground(QColor("#667085"))
-            else:
-                model_item.setEnabled(True)
-        combo.setCurrentIndex(0)
-        combo.blockSignals(False)
-        try:
-            combo.hidePopup()
-        except Exception:
-            pass
+            hidden = set()
+        self._rebuild_action_combo(hidden)
 
     def _apply_psr_asr_panel(self, is_psr: bool):
         if not getattr(self, "asr_panel", None):
@@ -12632,7 +11092,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         assist_cfg.setdefault("boundary_confusion_weight", 0.20)
         assist_cfg.setdefault("boundary_energy_weight", 0.10)
         assist_cfg.setdefault("boundary_merge_weight", 0.15)
-
+        assist_cfg.setdefault("boundary_training_utility_weight", 0.15)
+        assist_cfg.setdefault("onset_anchor_weight", 0.20)
+        assist_cfg.setdefault("onset_anchor_radius", 12)
+        assist_cfg.setdefault("query_propagation_weight", 0.20)
+        assist_cfg.setdefault("query_cost_weight", 0.10)
+        assist_cfg.setdefault("query_risk_weight", 0.15)
+        assist_cfg.setdefault("locked_region_radius", 12)
+        assist_cfg.setdefault("consistency_alert_weight", 0.20)
         psr_cfg = cfg.setdefault("psr", {})
         if not isinstance(psr_cfg, dict):
             psr_cfg = {}
@@ -12741,12 +11208,10 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _boundary_features_dir_candidates(self) -> List[str]:
         candidates: List[str] = []
         for raw in (
-            getattr(self, "currentEastFeatureDir", None),
-            self._default_east_features_dir_for_video(),
-            getattr(self, "currentFeatureDir", None),
+            getattr(self, 'currentFeatureDir', None),
             self._default_features_dir_for_video(),
         ):
-            path = str(raw or "").strip()
+            path = str(raw or '').strip()
             if not path:
                 continue
             path = os.path.abspath(path)
@@ -12754,7 +11219,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 continue
             if not os.path.isdir(path):
                 continue
-            if not os.path.isfile(os.path.join(path, "features.npy")):
+            if not os.path.isfile(os.path.join(path, 'features.npy')):
                 continue
             candidates.append(path)
         return candidates
@@ -12814,75 +11279,55 @@ class ActionWindow(FrameControlMixin, QWidget):
         for features_dir in self._boundary_features_dir_candidates():
             cache = self._ensure_boundary_snap_cache(features_dir)
 
-            boundary_path = os.path.join(features_dir, "east_runtime", "boundary.npy")
-            if os.path.isfile(boundary_path):
-                if cache.get("boundary_path") != boundary_path:
-                    try:
-                        cache["boundary_score"] = np.load(boundary_path, mmap_mode="r")
-                    except Exception:
-                        cache["boundary_score"] = None
-                    cache["boundary_path"] = boundary_path
-                boundary = cache.get("boundary_score")
-                if isinstance(boundary, np.ndarray) and boundary.ndim >= 1:
-                    seq_len = int(boundary.shape[0])
-                    frame_map = self._feature_frame_map(features_dir, seq_len)
-                    return {
-                        "source": "east_boundary",
-                        "data": boundary,
-                        "frame_map": frame_map,
-                        "length": seq_len,
-                        "features_dir": features_dir,
-                    }
-
             logits_path = self._find_boundary_logits_path(features_dir)
             if logits_path:
-                if cache.get("logits_path") != logits_path:
+                if cache.get('logits_path') != logits_path:
                     try:
-                        cache["logits"] = np.load(logits_path, mmap_mode="r")
+                        cache['logits'] = np.load(logits_path, mmap_mode='r')
                     except Exception:
-                        cache["logits"] = None
-                    cache["logits_path"] = logits_path
-                logits = cache.get("logits")
+                        cache['logits'] = None
+                    cache['logits_path'] = logits_path
+                logits = cache.get('logits')
                 if isinstance(logits, np.ndarray) and logits.ndim >= 2:
                     seq_len = int(logits.shape[0])
                     frame_map = self._feature_frame_map(features_dir, seq_len)
                     return {
-                        "source": "logits",
-                        "data": logits,
-                        "frame_map": frame_map,
-                        "length": seq_len,
-                        "features_dir": features_dir,
+                        'source': 'logits',
+                        'data': logits,
+                        'frame_map': frame_map,
+                        'length': seq_len,
+                        'features_dir': features_dir,
                     }
 
-            if cache.get("features") is None:
-                feat_path = os.path.join(features_dir, "features.npy")
+            if cache.get('features') is None:
+                feat_path = os.path.join(features_dir, 'features.npy')
                 try:
-                    cache["features"] = np.load(feat_path, mmap_mode="r")
+                    cache['features'] = np.load(feat_path, mmap_mode='r')
                 except Exception:
-                    cache["features"] = None
-                feat = cache.get("features")
+                    cache['features'] = None
+                feat = cache.get('features')
                 if isinstance(feat, np.ndarray) and feat.ndim == 2:
                     h, w = feat.shape
                     if h == 2048 and w != 2048:
-                        cache["features_layout"] = "BDT"
+                        cache['features_layout'] = 'BDT'
                     elif w == 2048 and h != 2048:
-                        cache["features_layout"] = "BTD"
+                        cache['features_layout'] = 'BTD'
                     else:
-                        cache["features_layout"] = "BTD"
+                        cache['features_layout'] = 'BTD'
 
-            feat = cache.get("features")
+            feat = cache.get('features')
             if not isinstance(feat, np.ndarray) or feat.ndim != 2:
                 continue
-            layout = cache.get("features_layout", "BTD")
-            seq_len = int(feat.shape[1] if layout == "BDT" else feat.shape[0])
+            layout = cache.get('features_layout', 'BTD')
+            seq_len = int(feat.shape[1] if layout == 'BDT' else feat.shape[0])
             frame_map = self._feature_frame_map(features_dir, seq_len)
             return {
-                "source": "features",
-                "data": feat,
-                "frame_map": frame_map,
-                "length": seq_len,
-                "layout": layout,
-                "features_dir": features_dir,
+                'source': 'features',
+                'data': feat,
+                'frame_map': frame_map,
+                'length': seq_len,
+                'layout': layout,
+                'features_dir': features_dir,
             }
         return None
 
@@ -12897,25 +11342,14 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _boundary_energy_at(self, series: Dict[str, Any], idx: int) -> Optional[float]:
         if idx <= 0:
             return None
-        data_len = int(series.get("length") or 0)
+        data_len = int(series.get('length') or 0)
         if idx >= data_len:
             return None
-        if series.get("source") == "east_boundary":
-            data = series.get("data")
-            if data is None:
-                return None
-            try:
-                val = float(np.asarray(data[idx]).reshape(-1)[0])
-            except Exception:
-                return None
-            if not np.isfinite(val):
-                return 0.0
-            return float(np.clip(val, 0.0, 1.0))
         v0 = self._series_vector(series, idx - 1)
         v1 = self._series_vector(series, idx)
         if v0 is None or v1 is None:
             return None
-        if series.get("source") == "logits":
+        if series.get('source') == 'logits':
             val = float(np.linalg.norm(v1 - v0))
         else:
             denom = float(np.linalg.norm(v0) * np.linalg.norm(v1))
@@ -12947,26 +11381,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         return self._boundary_energy_at(series, idx)
 
     def _boundary_review_score_at_frame(self, frame: int) -> Optional[float]:
-        series = self._get_boundary_series()
-        if not series:
-            return None
-        if series.get("source") != "east_boundary":
-            return None
-        frame_map = series.get("frame_map") or []
-        if not frame_map:
-            return None
-        try:
-            frame = int(frame)
-        except Exception:
-            return None
-        idx = bisect.bisect_left(frame_map, frame)
-        if idx >= len(frame_map):
-            idx = len(frame_map) - 1
-        if idx > 0:
-            prev = idx - 1
-            if abs(frame_map[prev] - frame) <= abs(frame_map[idx] - frame):
-                idx = prev
-        return self._boundary_energy_at(series, idx)
+        return self._boundary_energy_at_frame(frame)
 
     def _throttle_boundary_points(self, points: List[dict]) -> List[dict]:
         gap = self._assisted_boundary_min_gap()
@@ -13030,14 +11445,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             return frame
 
         series = self._get_boundary_series()
-        if series and series.get("source") != "east_boundary":
-            candidates = [
-                c
-                for c in (self._auto_boundary_candidates or [])
-                if win_start <= c <= win_end
-            ]
-            if candidates:
-                return int(min(candidates, key=lambda c: (abs(c - frame), c)))
         if not series:
             candidates = [
                 c
@@ -13047,8 +11454,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             if candidates:
                 return int(min(candidates, key=lambda c: (abs(c - frame), c)))
             return frame
-        frame_map = series.get("frame_map") or []
-        data_len = int(series.get("length") or 0)
+        frame_map = series.get('frame_map') or []
+        data_len = int(series.get('length') or 0)
         if not frame_map or data_len <= 1:
             return frame
         if len(frame_map) > data_len:
@@ -13205,31 +11612,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         return self._cfg_float(cfg.get(key, default), default, lo=0.0, hi=1.0)
 
     def _current_runtime_confusion_map(self) -> Dict[str, Dict[str, float]]:
-        features_dir = self._correction_features_dir()
-        if not features_dir:
-            return {}
-        path = os.path.join(os.path.abspath(features_dir), "east_runtime", "model_delta.pt")
-        try:
-            stamp = float(os.path.getmtime(path)) if os.path.isfile(path) else -1.0
-        except Exception:
-            stamp = -1.0
-        cache = getattr(self, "_assisted_confusion_cache", None)
-        if (
-            isinstance(cache, dict)
-            and cache.get("path") == path
-            and float(cache.get("stamp", -2.0) or -2.0) == float(stamp)
-        ):
-            return dict(cache.get("data") or {})
-        try:
-            data = load_east_runtime_confusion_map(features_dir)
-        except Exception:
-            data = {}
-        self._assisted_confusion_cache = {
-            "path": path,
-            "stamp": float(stamp),
-            "data": dict(data or {}),
-        }
-        return dict(data or {})
+        return {}
 
     def _label_support_count(self, label_name: str) -> float:
         label = str(label_name or "").strip()
@@ -13372,6 +11755,223 @@ class ActionWindow(FrameControlMixin, QWidget):
         score = 1.0 - abs(val - center) / radius
         return max(0.0, min(1.0, float(score)))
 
+    def _onset_anchor_bonus_for_frame(self, frame: int) -> float:
+        anchors = list(getattr(self, "_onset_anchors", []) or [])
+        if not anchors:
+            return 0.0
+        cfg = self._assisted_cfg()
+        radius = self._cfg_int(cfg.get("onset_anchor_radius", 12), 12, lo=1, hi=120)
+        frame_i = int(frame)
+        best = 0.0
+        for anchor in anchors:
+            if not isinstance(anchor, dict):
+                continue
+            anchor_frame = anchor.get("frame", None)
+            try:
+                anchor_frame = int(anchor_frame)
+            except Exception:
+                continue
+            start_frame = anchor.get("start_frame", None)
+            end_frame = anchor.get("end_frame", None)
+            try:
+                if start_frame is not None and end_frame is not None:
+                    lo = min(int(start_frame), int(end_frame)) - 1
+                    hi = max(int(start_frame), int(end_frame)) + 1
+                    if frame_i < lo or frame_i > hi:
+                        continue
+            except Exception:
+                pass
+            dist = abs(frame_i - anchor_frame)
+            if dist > radius:
+                continue
+            score = 1.0 - (float(dist) / float(max(1, radius)))
+            best = max(best, max(0.0, min(1.0, score)))
+        return float(max(0.0, min(1.0, best)))
+
+    def _locked_regions_near_frame(self, frame: int) -> List[Dict[str, Any]]:
+        rows = list(getattr(self, "_event_locked_regions", []) or [])
+        if not rows:
+            return []
+        cfg = self._assisted_cfg()
+        radius = self._cfg_int(cfg.get("locked_region_radius", 12), 12, lo=0, hi=240)
+        frame_i = int(frame)
+        hits: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                start = int(row.get("start_frame", frame_i))
+                end = int(row.get("end_frame", start))
+            except Exception:
+                continue
+            lo = min(start, end) - radius
+            hi = max(start, end) + radius
+            if lo <= frame_i <= hi:
+                hits.append(row)
+        return hits
+
+    def _consistency_flags_near_frame(self, frame: int) -> List[Dict[str, Any]]:
+        rows = list(getattr(self, "_event_graph_consistency_flags", []) or [])
+        if not rows:
+            return []
+        cfg = self._assisted_cfg()
+        radius = self._cfg_int(cfg.get("locked_region_radius", 12), 12, lo=0, hi=240)
+        frame_i = int(frame)
+        hits: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            near = False
+            for key in ("start_frame", "contact_onset_frame", "end_frame"):
+                try:
+                    pos = int(row.get(key))
+                except Exception:
+                    continue
+                if abs(frame_i - pos) <= radius:
+                    near = True
+                    break
+            if near:
+                hits.append(row)
+        return hits
+
+    def _locked_region_overlap_ratio(self, start: int, end: int) -> float:
+        lo = int(min(start, end))
+        hi = int(max(start, end))
+        span = max(1, hi - lo + 1)
+        overlap = 0
+        for row in list(getattr(self, "_event_locked_regions", []) or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                rs = int(row.get("start_frame", lo))
+                re = int(row.get("end_frame", rs))
+            except Exception:
+                continue
+            ov_lo = max(lo, min(rs, re))
+            ov_hi = min(hi, max(rs, re))
+            if ov_hi >= ov_lo:
+                overlap += ov_hi - ov_lo + 1
+        return float(max(0.0, min(1.0, float(overlap) / float(span))))
+
+    def _consistency_alert_ratio_for_span(self, start: int, end: int) -> float:
+        lo = int(min(start, end))
+        hi = int(max(start, end))
+        hits = 0
+        for row in list(getattr(self, "_event_graph_consistency_flags", []) or []):
+            if not isinstance(row, dict):
+                continue
+            frames = []
+            for key in ("start_frame", "contact_onset_frame", "end_frame"):
+                try:
+                    frames.append(int(row.get(key)))
+                except Exception:
+                    continue
+            if any(lo <= frame <= hi for frame in frames):
+                hits += 1
+        return float(max(0.0, min(1.0, hits / 3.0)))
+
+    def _estimate_query_human_cost(
+        self,
+        point_type: str,
+        *,
+        source: str = "model",
+        candidate_count: int = 0,
+    ) -> float:
+        ptype = str(point_type or "").strip().lower()
+        if ptype == "boundary":
+            base = 0.58
+            if list(getattr(self, "_onset_anchors", []) or []):
+                base = 0.52
+        else:
+            base = 0.34 if str(source or "model").strip().lower() == "embedding" else 0.40
+            if candidate_count >= 4:
+                base += 0.05
+        return float(max(0.0, min(1.0, base)))
+
+    def _compose_voi_score(
+        self,
+        *,
+        base_score: float,
+        propagation_gain: float,
+        human_cost: float,
+        overwrite_risk: float,
+    ) -> float:
+        cfg = self._assisted_cfg()
+        wp = self._cfg_float(cfg.get("query_propagation_weight", 0.20), 0.20, lo=0.0, hi=1.0)
+        wc = self._cfg_float(cfg.get("query_cost_weight", 0.10), 0.10, lo=0.0, hi=1.0)
+        wr = self._cfg_float(cfg.get("query_risk_weight", 0.15), 0.15, lo=0.0, hi=1.0)
+        score = float(base_score + wp * propagation_gain - wc * human_cost - wr * overwrite_risk)
+        return float(max(0.0, min(1.0, score)))
+
+    def _boundary_propagation_gain(self, frame: int, left_label: str, right_label: str) -> float:
+        onset_gain = self._onset_anchor_bonus_for_frame(int(frame))
+        locked_gain = max(0.0, min(1.0, len(self._locked_regions_near_frame(int(frame))) / 2.0))
+        consistency_gain = max(0.0, min(1.0, len(self._consistency_flags_near_frame(int(frame))) / 2.0))
+        label_switch = 1.0 if str(left_label or "").strip() != str(right_label or "").strip() else 0.35
+        cfg = self._assisted_cfg()
+        consistency_w = self._cfg_float(cfg.get("consistency_alert_weight", 0.20), 0.20, lo=0.0, hi=1.0)
+        base = 0.40 * onset_gain + 0.30 * locked_gain + consistency_w * consistency_gain + 0.10 * label_switch
+        return float(max(0.0, min(1.0, base)))
+
+    def _boundary_overwrite_risk(self, frame: int) -> float:
+        cfg = self._assisted_cfg()
+        radius = self._cfg_int(cfg.get("locked_region_radius", 12), 12, lo=0, hi=240)
+        frame_i = int(frame)
+        risk = 0.0
+        for row in self._locked_regions_near_frame(frame_i):
+            try:
+                start = int(row.get("start_frame", frame_i))
+                end = int(row.get("end_frame", start))
+            except Exception:
+                continue
+            lo = min(start, end)
+            hi = max(start, end)
+            if lo <= frame_i <= hi:
+                risk = max(risk, 0.75)
+            else:
+                dist = min(abs(frame_i - lo), abs(frame_i - hi))
+                if dist <= radius:
+                    risk = max(risk, 0.35 + 0.30 * (1.0 - float(dist) / float(max(1, radius))))
+        if self._onset_anchor_bonus_for_frame(frame_i) > 0.0:
+            risk = max(risk, 0.25)
+        return float(max(0.0, min(1.0, risk)))
+
+    def _label_propagation_gain(
+        self,
+        seg: dict,
+        *,
+        disagreement: float,
+        source: str = "model",
+    ) -> float:
+        start = int(seg.get("start", 0))
+        end = int(seg.get("end", start))
+        overlap_gain = self._locked_region_overlap_ratio(start, end)
+        consistency_gain = self._consistency_alert_ratio_for_span(start, end)
+        anchor_gain = 0.0
+        for anchor in list(getattr(self, "_onset_anchors", []) or []):
+            if not isinstance(anchor, dict):
+                continue
+            try:
+                frame = int(anchor.get("frame"))
+            except Exception:
+                continue
+            if start <= frame <= end:
+                anchor_gain = max(anchor_gain, 1.0)
+                break
+        source_bonus = 0.10 if str(source or "model").strip().lower() == "embedding" else 0.0
+        base = 0.35 * overlap_gain + 0.30 * consistency_gain + 0.25 * disagreement + 0.10 * anchor_gain + source_bonus
+        return float(max(0.0, min(1.0, base)))
+
+    def _label_overwrite_risk(self, seg: dict) -> float:
+        start = int(seg.get("start", 0))
+        end = int(seg.get("end", start))
+        span = max(1, abs(end - start) + 1)
+        overlap_gain = self._locked_region_overlap_ratio(start, end)
+        consistency_gain = self._consistency_alert_ratio_for_span(start, end)
+        span_penalty = max(0.0, min(1.0, float(span) / 120.0))
+        risk = 0.45 * overlap_gain + 0.20 * consistency_gain + 0.15 * span_penalty
+        return float(max(0.0, min(1.0, risk)))
+
     def _boundary_query_score(
         self,
         *,
@@ -13386,19 +11986,43 @@ class ActionWindow(FrameControlMixin, QWidget):
         energy = self._normalize_boundary_energy_for_query(frame)
         merge_bonus = 1.0 if str(left_label or "").strip() == str(right_label or "").strip() and str(left_label or "").strip() else 0.0
         utility = self._boundary_training_utility_score(left_label, right_label)
+        onset_anchor = self._onset_anchor_bonus_for_frame(int(frame))
         wu = self._cfg_float(cfg.get("boundary_uncertainty_weight", 0.55), 0.55, lo=0.0, hi=1.0)
         wc = self._cfg_float(cfg.get("boundary_confusion_weight", 0.20), 0.20, lo=0.0, hi=1.0)
         we = self._cfg_float(cfg.get("boundary_energy_weight", 0.10), 0.10, lo=0.0, hi=1.0)
         wm = self._cfg_float(cfg.get("boundary_merge_weight", 0.15), 0.15, lo=0.0, hi=1.0)
         wt = self._cfg_float(cfg.get("boundary_training_utility_weight", 0.15), 0.15, lo=0.0, hi=1.0)
-        score = float(wu * uncertainty + wc * confusion + we * energy + wm * merge_bonus + wt * utility)
-        score = max(0.0, min(1.0, score))
+        wa = self._cfg_float(cfg.get("onset_anchor_weight", 0.20), 0.20, lo=0.0, hi=1.0)
+        base_score = float(
+            wu * uncertainty
+            + wc * confusion
+            + we * energy
+            + wm * merge_bonus
+            + wt * utility
+            + wa * onset_anchor
+        )
+        base_score = max(0.0, min(1.0, base_score))
+        propagation_gain = self._boundary_propagation_gain(int(frame), left_label, right_label)
+        overwrite_risk = self._boundary_overwrite_risk(int(frame))
+        human_cost_est = self._estimate_query_human_cost("boundary")
+        score = self._compose_voi_score(
+            base_score=base_score,
+            propagation_gain=propagation_gain,
+            human_cost=human_cost_est,
+            overwrite_risk=overwrite_risk,
+        )
         return score, {
             "uncertainty": float(uncertainty),
             "confusion": float(confusion),
             "energy": float(energy),
             "merge_bonus": float(merge_bonus),
             "training_utility": float(utility),
+            "onset_anchor": float(onset_anchor),
+            "propagation_gain": float(propagation_gain),
+            "overwrite_risk": float(overwrite_risk),
+            "human_cost_est": float(human_cost_est),
+            "base_score": float(base_score),
+            "voi_score": float(score),
         }
 
     def _label_query_score(
@@ -13463,13 +12087,29 @@ class ActionWindow(FrameControlMixin, QWidget):
         wd = self._cfg_float(cfg.get("label_disagreement_weight", 0.20), 0.20, lo=0.0, hi=1.0)
         wc = self._cfg_float(cfg.get("label_confusion_weight", 0.25), 0.25, lo=0.0, hi=1.0)
         wt = self._cfg_float(cfg.get("label_training_utility_weight", 0.15), 0.15, lo=0.0, hi=1.0)
-        score = float(wu * uncertainty + wd * disagreement + wc * confusion + wt * utility)
-        score = max(0.0, min(1.0, score))
+        base_score = float(wu * uncertainty + wd * disagreement + wc * confusion + wt * utility)
+        base_score = max(0.0, min(1.0, base_score))
+        propagation_gain = self._label_propagation_gain(seg, disagreement=disagreement, source=source)
+        overwrite_risk = self._label_overwrite_risk(seg)
+        human_cost_est = self._estimate_query_human_cost(
+            "label", source=source, candidate_count=len(candidates)
+        )
+        score = self._compose_voi_score(
+            base_score=base_score,
+            propagation_gain=propagation_gain,
+            human_cost=human_cost_est,
+            overwrite_risk=overwrite_risk,
+        )
         return score, {
             "uncertainty": float(uncertainty),
             "disagreement": float(disagreement),
             "confusion": float(confusion),
             "training_utility": float(utility),
+            "propagation_gain": float(propagation_gain),
+            "overwrite_risk": float(overwrite_risk),
+            "human_cost_est": float(human_cost_est),
+            "base_score": float(base_score),
+            "voi_score": float(score),
         }
 
     def _update_label_prototype(
@@ -14184,6 +12824,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "status": status,
                 "score": raw_score,
                 "query_score": float(query_score),
+                "voi_score": float(query_terms.get("voi_score", query_score) or query_score),
+                "base_query_score": float(query_terms.get("base_score", query_score) or query_score),
+                "propagation_gain": float(query_terms.get("propagation_gain", 0.0) or 0.0),
+                "overwrite_risk": float(query_terms.get("overwrite_risk", 0.0) or 0.0),
+                "human_cost_est": float(query_terms.get("human_cost_est", 0.0) or 0.0),
                 "query_terms": dict(query_terms),
                 "id": 0,
             }
@@ -14220,6 +12865,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "status": status,
                 "score": candidates[0][1] if candidates else None,
                 "query_score": float(query_score),
+                "voi_score": float(query_terms.get("voi_score", query_score) or query_score),
+                "base_query_score": float(query_terms.get("base_score", query_score) or query_score),
+                "propagation_gain": float(query_terms.get("propagation_gain", 0.0) or 0.0),
+                "overwrite_risk": float(query_terms.get("overwrite_risk", 0.0) or 0.0),
+                "human_cost_est": float(query_terms.get("human_cost_est", 0.0) or 0.0),
                 "query_terms": dict(query_terms),
                 "candidate_source": str(source),
                 "id": 0,
@@ -15137,7 +13787,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             QMessageBox.information(
                 self,
                 "Assisted Review",
-                "Run automatic segmentation (EAST / ASOT / FACT) before entering Assisted Review.",
+                "Run automatic segmentation (ASOT / FACT) before entering Assisted Review.",
             )
             try:
                 self.btn_assisted.setChecked(False)
@@ -15510,6 +14160,32 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._rebuild_timeline_sources()
         self._dirty = True
         return extra
+
+    def _load_structured_event_graph_sidecar(self, main_path: str) -> None:
+        self._structured_event_graph = {}
+        self._onset_anchors = []
+        self._event_locked_regions = []
+        self._event_graph_consistency_flags = []
+        path = event_graph_sidecar_path(main_path)
+        if not path:
+            return
+        graph = load_event_graph_sidecar(main_path)
+        if not graph:
+            return
+        self._structured_event_graph = graph
+        self._onset_anchors = extract_onset_anchors(graph)
+        self._event_locked_regions = extract_locked_regions(graph)
+        self._event_graph_consistency_flags = extract_consistency_flags(graph)
+        events = graph.get("events", []) if isinstance(graph, dict) else []
+        event_count = len(events) if isinstance(events, list) else 0
+        self._log(
+            "load_event_graph_sidecar",
+            path=path,
+            anchors=len(self._onset_anchors),
+            locked_regions=len(self._event_locked_regions),
+            consistency_flags=len(self._event_graph_consistency_flags),
+            events=event_count,
+        )
 
     def _extra_sidecar_path(self) -> Optional[str]:
         if not self.current_annotation_path:
@@ -15941,30 +14617,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 break
         return [(int(s), int(e)) for s, e in fragments if int(e) >= int(s)]
 
-    def _masked_refresh_safe_state(self, features_dir: str) -> Tuple[bool, str]:
-        path = os.path.abspath(os.path.expanduser(str(features_dir or "").strip()))
-        current_dir = os.path.abspath(
-            os.path.expanduser(str(self._east_assets_features_dir() or "").strip())
-        )
-        if not path or not os.path.isdir(path):
-            return False, "invalid_features_dir"
-        if not current_dir or path != current_dir:
-            return False, "stale_runtime"
-        if not self._is_action_task() or self._is_psr_task():
-            return False, "inactive_task"
-        if str(getattr(self, "mode", "") or "") != "Coarse":
-            return False, "non_coarse_mode"
-        if bool(self.interaction_mode) or bool(self.extra_mode):
-            return False, "interaction_busy"
-        if bool(getattr(self, "_infer_thread_east", None)) and self._infer_thread_east.isRunning():
-            return False, "east_refine_running"
-        if self._east_online_update_running or self._east_online_adapter_running:
-            return False, "online_update_running"
-        if any(getattr(st, "frame_to_label", None) for st in (self.entity_stores or {}).values()):
-            return False, "entity_annotations_present"
-        if any(getattr(st, "frame_to_label", None) for st in (self.phase_stores or {}).values()):
-            return False, "phase_annotations_present"
-        return True, ""
 
     # ----- auto labeling results -----
     def _apply_autolabel_predictions(
@@ -16025,7 +14677,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.views[self.active_view_idx]["confirmed_accept_records"] = []
         self._write_correction_record_buffer([], force=True)
         self._correction_buffer = CorrectionBuffer()
-        self._schedule_east_online_update(self._correction_features_dir())
         if "ASOT" in str(model_name).upper():
             self._auto_boundary_candidates = sorted(set(boundary_candidates))
         else:
@@ -16191,8 +14842,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.extra_store = AnnotationStore()
             self.extra_cuts = []
             result_name = {
-                "EAST": "EAST refinement",
-                "ASOT": "ASOT pre-labeling",
+                    "ASOT": "ASOT pre-labeling",
                 "FACT": "FACT labeling",
             }.get(str(model_name or "").upper(), str(model_name or "Model"))
             self._set_status(
@@ -16208,163 +14858,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._dirty = True
         self._has_auto_segments = True
 
-    def _apply_east_predictions_masked(
-        self, txt_path: str, json_path: Optional[str]
-    ) -> bool:
-        if not txt_path or not os.path.isfile(txt_path):
-            return False
-        features_dir = os.path.abspath(os.path.dirname(txt_path))
-        ok, _reason = self._masked_refresh_safe_state(features_dir)
-        if not ok:
-            return False
-        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
-            return False
-        view = self.views[self.active_view_idx]
-        current_store = view.get("store") or self.store
-        if current_store is None:
-            return False
-        baseline_store = self._active_label_baseline_store()
-        if baseline_store is None:
-            baseline_store = AnnotationStore()
-            view["prelabel_store"] = baseline_store
-            self.prelabel_store = baseline_store
-        view["prelabel_source"] = "EAST"
-        self._prelabel_source = "EAST"
-
-        classes, segs, topk_map = self._load_prediction_output(txt_path, json_path)
-        if not segs:
-            return False
-        self._ensure_action_labels_for_names(classes)
-        pred_segments, pred_map, boundary_candidates = self._prediction_segments_for_active_view(
-            segs, classes
-        )
-        if not pred_segments:
-            return False
-
-        view_start = int(view.get("start", 0))
-        view_end = int(view.get("end", view_start))
-        if view_end < view_start:
-            view_start, view_end = view_end, view_start
-
-        locked_segments = self._locked_segments_for_active_view()
-        locked_spans = self._merge_spans(
-            [(int(seg.get("start", 0)), int(seg.get("end", 0))) for seg in locked_segments]
-        )
-        final_segments: List[Dict[str, Any]] = []
-        for seg in pred_segments:
-            label = str(seg.get("label", "") or "").strip()
-            if not label:
-                continue
-            for frag_s, frag_e in self._subtract_locked_spans(
-                int(seg.get("start", 0)),
-                int(seg.get("end", 0)),
-                locked_spans,
-            ):
-                final_segments.append(
-                    {"start": int(frag_s), "end": int(frag_e), "label": label}
-                )
-        for seg in locked_segments:
-            label = str(seg.get("label", "") or "").strip()
-            if not label:
-                continue
-            final_segments.append(
-                {
-                    "start": int(seg.get("start", 0)),
-                    "end": int(seg.get("end", seg.get("start", 0))),
-                    "label": label,
-                }
-            )
-        final_segments = sorted(
-            [
-                {
-                    "start": max(view_start, int(seg.get("start", 0))),
-                    "end": min(view_end, int(seg.get("end", seg.get("start", 0)))),
-                    "label": str(seg.get("label", "") or "").strip(),
-                }
-                for seg in final_segments
-                if str(seg.get("label", "") or "").strip()
-            ],
-            key=lambda seg: (int(seg["start"]), int(seg["end"]), str(seg["label"])),
-        )
-        final_segments = [seg for seg in final_segments if int(seg["end"]) >= int(seg["start"])]
-        if not final_segments:
-            return False
-
-        final_frame_map: Dict[int, str] = {}
-        for seg in final_segments:
-            for frame in range(int(seg["start"]), int(seg["end"]) + 1):
-                final_frame_map[int(frame)] = str(seg["label"])
-
-        unlocked_spans: List[Tuple[int, int]] = []
-        cursor = int(view_start)
-        for lock_s, lock_e in locked_spans:
-            lock_s = max(int(view_start), int(lock_s))
-            lock_e = min(int(view_end), int(lock_e))
-            if cursor < lock_s:
-                unlocked_spans.append((int(cursor), int(lock_s - 1)))
-            cursor = max(int(cursor), int(lock_e + 1))
-        if cursor <= int(view_end):
-            unlocked_spans.append((int(cursor), int(view_end)))
-
-        self._replace_store_frames_in_span(
-            current_store,
-            int(view_start),
-            int(view_end),
-            final_frame_map,
-        )
-        self._patch_store_frames_in_spans(
-            baseline_store,
-            unlocked_spans,
-            pred_map,
-        )
-
-        current_cuts = self._trim_cut_set_for_view(view, {"kind": "store"}, create=True)
-        final_cut_positions = {
-            int(seg.get("start", 0))
-            for seg in final_segments
-            if int(seg.get("start", 0)) > int(view_start)
-        }
-        self._replace_cut_set_in_span(
-            current_cuts,
-            int(view_start),
-            int(view_end),
-            final_cut_positions,
-        )
-
-        baseline_cuts = self._baseline_trim_cut_set_for_view(
-            view, {"kind": "store"}, create=True
-        )
-        protected_cuts = set()
-        for seg in locked_segments:
-            s = int(seg.get("start", 0))
-            e = int(seg.get("end", s))
-            if s > int(view_start):
-                protected_cuts.add(int(s))
-            if e < int(view_end):
-                protected_cuts.add(int(e + 1))
-        self._replace_cut_set_excluding_positions(
-            baseline_cuts,
-            int(view_start),
-            int(view_end),
-            protected_positions=protected_cuts,
-            new_cuts=boundary_candidates,
-        )
-
-        self.currentEastFeatureDir = features_dir
-        self._assisted_candidates = dict(topk_map or {})
-        self._auto_boundary_source = "EAST"
-        self._dirty = True
-        self._has_auto_segments = True
-        self.panel.refresh()
-        self._rebuild_timeline_sources()
-        try:
-            self.timeline.refresh_all_rows()
-        except Exception:
-            self.timeline.update()
-        self._update_gap_indicator()
-        self._rebuild_confirmed_correction_records_for_active_view()
-        self._write_correction_record_buffer(self._confirmed_correction_records)
-        return True
 
     def _patch_assisted_candidates_in_spans(
         self,
@@ -16418,136 +14911,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._auto_boundary_candidates = sorted(set(int(x) for x in keep))
 
-    def _apply_east_predictions_masked_local(self, payload: Dict[str, Any]) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        features_dir = os.path.abspath(
-            os.path.expanduser(str(payload.get("features_dir") or "").strip())
-        )
-        ok, _reason = self._masked_refresh_safe_state(features_dir)
-        if not ok:
-            return False
-        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
-            return False
-        view = self.views[self.active_view_idx]
-        current_store = view.get("store") or self.store
-        if current_store is None:
-            return False
-        baseline_store = self._active_label_baseline_store()
-        if baseline_store is None:
-            baseline_store = AnnotationStore()
-            view["prelabel_store"] = baseline_store
-            self.prelabel_store = baseline_store
-        view["prelabel_source"] = "EAST"
-        self._prelabel_source = "EAST"
-
-        windows = [dict(item) for item in (payload.get("windows") or []) if isinstance(item, dict)]
-        pred_segments: List[Dict[str, Any]] = []
-        classes: List[str] = []
-        topk_map: Dict[Tuple[int, int], List[Tuple[str, Optional[float]]]] = {}
-        boundary_candidates: List[int] = []
-        covered_spans: List[Tuple[int, int]] = []
-        for item in windows:
-            if not bool(item.get("ok", False)):
-                continue
-            for name in item.get("classes") or []:
-                label = str(name or "").strip()
-                if label and label not in classes:
-                    classes.append(label)
-            for seg in item.get("segments") or []:
-                try:
-                    s = int(seg.get("start", 0))
-                    e = int(seg.get("end", s))
-                    label = str(seg.get("label", "") or "").strip()
-                except Exception:
-                    continue
-                if not label or e < s:
-                    continue
-                pred_segments.append({"start": int(s), "end": int(e), "label": label})
-            for raw in item.get("boundary_candidates") or []:
-                try:
-                    boundary_candidates.append(int(raw))
-                except Exception:
-                    continue
-            for row in item.get("topk_map") or []:
-                if not isinstance(row, dict):
-                    continue
-                try:
-                    s = int(row.get("start", 0))
-                    e = int(row.get("end", s))
-                except Exception:
-                    continue
-                items: List[Tuple[str, Optional[float]]] = []
-                for sub in row.get("items") or []:
-                    if not isinstance(sub, dict):
-                        continue
-                    name = str(sub.get("name", "") or "").strip()
-                    if not name:
-                        continue
-                    score = sub.get("score")
-                    try:
-                        score = float(score) if score is not None else None
-                    except Exception:
-                        score = None
-                    items.append((name, score))
-                if items:
-                    topk_map[(int(s), int(e))] = items
-            for span in item.get("focus_spans") or []:
-                try:
-                    covered_spans.append((int(span[0]), int(span[1])))
-                except Exception:
-                    continue
-
-        covered_spans = self._merge_spans(covered_spans)
-        if not pred_segments or not covered_spans:
-            return False
-        self._ensure_action_labels_for_names(classes)
-
-        pred_map: Dict[int, str] = {}
-        for seg in pred_segments:
-            for frame in range(int(seg["start"]), int(seg["end"]) + 1):
-                pred_map[int(frame)] = str(seg["label"])
-
-        self._patch_store_frames_in_spans(current_store, covered_spans, pred_map)
-        self._patch_store_frames_in_spans(baseline_store, covered_spans, pred_map)
-
-        current_cuts = self._trim_cut_set_for_view(view, {"kind": "store"}, create=True)
-        baseline_cuts = self._baseline_trim_cut_set_for_view(
-            view, {"kind": "store"}, create=True
-        )
-        for span_s, span_e in covered_spans:
-            local_cuts = [
-                int(frame)
-                for frame in boundary_candidates
-                if int(span_s) <= int(frame) <= int(span_e)
-            ]
-            self._replace_cut_set_in_span(current_cuts, int(span_s), int(span_e), local_cuts)
-            self._replace_cut_set_in_span(baseline_cuts, int(span_s), int(span_e), local_cuts)
-
-        self.currentEastFeatureDir = features_dir
-        self._patch_assisted_candidates_in_spans(covered_spans, topk_map)
-        self._patch_auto_boundary_candidates_in_spans(covered_spans, boundary_candidates)
-        self._auto_boundary_source = "EAST"
-        self._dirty = True
-        self._has_auto_segments = True
-        self.panel.refresh()
-        self._rebuild_timeline_sources()
-        try:
-            self.timeline.refresh_all_rows()
-        except Exception:
-            self.timeline.update()
-        self._update_gap_indicator()
-        try:
-            self._build_assisted_points_from_store(preserve_status=True, active_hint=None)
-        except Exception:
-            pass
-        self._rebuild_confirmed_correction_records_for_active_view()
-        self._write_correction_record_buffer(self._confirmed_correction_records)
-        return True
 
     def _on_infer_done(self, txt_path: str, json_path: str, model_name: str = "FACT"):
         run_name = {
-            "EAST": "EAST refinement",
             "ASOT": "ASOT pre-labeling",
             "FACT": "FACT labeling",
         }.get(str(model_name or "").upper(), f"{model_name} run")
@@ -16572,60 +14938,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             else:
                 self._set_status("FACT batch labeling failed.")
 
-    def _on_east_batch_progress(self, line: str):
-        self._set_status(line)
-        dlg = getattr(self, "_east_batch_progress", None)
-        if not dlg:
-            return
-        m = re.search(r"\((\d+)/(\d+)\)", line)
-        if m:
-            current = int(m.group(1))
-            total = int(m.group(2))
-            self._east_batch_current = current
-            self._east_batch_total = total
-            done = int(getattr(self, "_east_batch_done", 0) or 0)
-            if current > 1:
-                done = max(done, current - 1)
-                self._east_batch_done = done
-        if line.startswith("[INFO] Found"):
-            m = re.search(r"Found\s+(\d+)", line)
-            if m:
-                self._east_batch_total = int(m.group(1))
-        if line.startswith("[OK] EAST inference done:") or line.startswith("[WARN] failed "):
-            self._east_batch_done = int(getattr(self, "_east_batch_done", 0) or 0) + 1
-        if line.startswith("[OK] EAST batch inference done"):
-            if getattr(self, "_east_batch_total", None):
-                self._east_batch_done = int(self._east_batch_total)
 
-        total = int(getattr(self, "_east_batch_total", 0) or 0)
-        done = int(getattr(self, "_east_batch_done", 0) or 0)
-        current = int(getattr(self, "_east_batch_current", 0) or 0)
-        if total > 0:
-            if dlg.maximum() != total:
-                dlg.setRange(0, total)
-            dlg.setValue(min(done, total))
-            label = f"Batch pre-labeling (EAST)... {min(done, total)}/{total}"
-            if current > 0 and done < total:
-                label += f" (processing {min(current, total)}/{total})"
-            dlg.setLabelText(label)
-        else:
-            dlg.setRange(0, 0)
-            label = "Batch pre-labeling (EAST)..."
-            if current > 0:
-                label += f" (processing {current})"
-            dlg.setLabelText(label)
-
-    def _on_east_batch_done(self, ok: bool, output_dir: str):
-        self._close_progress_dialog(getattr(self, "_east_batch_progress", None))
-        self._east_batch_progress = None
-        if ok:
-            self._set_status(f"Batch pre-labeling done. Outputs in {output_dir}")
-        else:
-            log_hint = os.path.join(output_dir, "pred_east_batch.log")
-            if os.path.isfile(log_hint):
-                self._set_status(f"Batch pre-labeling failed; see log: {log_hint}")
-            else:
-                self._set_status("Batch pre-labeling failed.")
 
     def _on_asot_remap_build_progress(self, line: str):
         self._set_status(line)
@@ -16651,117 +14964,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._set_status("ASOT label remap build failed.")
 
     def on_click_batch_prelabel(self):
-        # Keep the main UI centered on the current EAST workflow.
-        # Legacy FACT batch tooling remains available internally for compatibility.
-        self.on_click_east_batch()
+        self.on_click_fact_batch()
 
-    def _run_east_refinement(self, features_dir: str):
-        if not features_dir or not os.path.isfile(os.path.join(features_dir, "features.npy")):
-            QMessageBox.warning(
-                self, "EAST", "EAST refinement requires features.npy for the current video."
-            )
-            return
-        if not self._ensure_east_model_paths():
-            return
-        label_txt = self._prepare_east_labels_file(features_dir)
-        if not label_txt:
-            return
-        meta = self._load_feature_meta(features_dir)
-        feature_backbone_version = str(
-            meta.get("backbone")
-            or meta.get("source")
-            or meta.get("feature_backbone_version")
-            or "east_backbone"
-        ).strip()
-        video_id = (
-            str(getattr(self, "current_video_id", "") or "").strip()
-            or os.path.splitext(os.path.basename(str(getattr(self, "video_path", "") or "")))[0]
-            or os.path.basename(os.path.abspath(features_dir))
-        )
-        log_path = os.path.join(features_dir, "pred_east_infer.log")
-        self._last_autolabel_log_path = log_path
-        self.btn_auto_label.setEnabled(False)
-        self._set_status(self._east_refine_launch_summary())
-        self._infer_thread_east = QThread(self)
-        self._infer_worker_east = EASTInferWorker(
-            features_dir=features_dir,
-            video_id=video_id,
-            video_path=str(getattr(self, "video_path", "") or ""),
-            labels_txt=label_txt,
-            ckpt=self._east_ckpt,
-            cfg=self._east_cfg,
-            text_bank_version=self._east_text_bank_version,
-            feature_backbone_version=feature_backbone_version,
-            category_adapter=self._effective_east_shared_adapter_path(),
-            out_prefix="pred_east",
-            log_path=log_path,
-        )
-        self._infer_worker_east.moveToThread(self._infer_thread_east)
-        self._infer_thread_east.started.connect(self._infer_worker_east.run)
-        self._infer_worker_east.progress.connect(self._set_status)
-        self._infer_worker_east.done.connect(self._on_east_infer_done)
-        self._infer_worker_east.done.connect(self._infer_thread_east.quit)
-        self._infer_thread_east.finished.connect(self._infer_worker_east.deleteLater)
-        self._infer_thread_east.start()
 
-    def _on_east_infer_done(self, txt_path: str, json_path: str):
-        try:
-            self.btn_auto_label.setEnabled(True)
-        except Exception:
-            pass
-        if txt_path:
-            self.currentEastFeatureDir = os.path.dirname(txt_path)
-        self._on_infer_done(txt_path, json_path, "EAST")
 
-    def on_click_auto_label(self):
-        if not getattr(self, "video_path", None):
-            QMessageBox.information(
-                self, "No video", "Load a video before running EAST refinement."
-            )
-            return
-        if self._east_masked_refresh_running:
-            self._set_status("EAST is finishing a background refresh for unlocked regions. Please wait.")
-            return
-        if not self._ensure_east_runtime_ready(
-            feature_name="Batch pre-labeling (EAST)",
-            unavailable_status=(
-                "Batch pre-labeling is unavailable until a full EAST-main checkout and the EAST runtime dependencies are installed."
-            ),
-            show_dialog=True,
-        ):
-            return
-        if not self._ensure_east_model_paths():
-            return
-        features_dir = getattr(self, "currentEastFeatureDir", None)
-        need_extract = (
-            (not features_dir)
-            or (not os.path.isdir(features_dir))
-            or (not os.path.isfile(os.path.join(features_dir, "features.npy")))
-        )
-        if need_extract:
-            feat_dir = self._ensure_east_features_for_current_video()
-            if not feat_dir:
-                return
-            self.currentEastFeatureDir = feat_dir
-            self._start_feature_extraction_and_east(feat_dir)
-            return
-        if not self._east_features_compatible(features_dir):
-            backbone_name = self._east_feature_meta_backbone(features_dir) or "unknown"
-            ret = QMessageBox.question(
-                self,
-                "Re-extract EAST features",
-                "Current refinement features are not EAST-compatible.\n\n"
-                f"Detected backbone: {backbone_name}\n\n"
-                "Re-extract EAST backbone features for the current video now?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if ret != QMessageBox.Yes:
-                self._set_status("EAST refinement cancelled.")
-                return
-            self._start_feature_extraction_and_east(features_dir)
-            return
-        self._run_east_refinement(features_dir)
 
     def _build_asot_label_remap(self):
         root_dir = QFileDialog.getExistingDirectory(
@@ -16823,7 +15029,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         feature_search_roots: List[str] = []
         for cand in (
             getattr(self, "currentFeatureDir", ""),
-            getattr(self, "currentEastFeatureDir", ""),
             os.path.join(root_dir, "videos"),
         ):
             path = os.path.abspath(os.path.expanduser(str(cand or "").strip()))
@@ -16859,79 +15064,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._asot_remap_thread.finished.connect(self._asot_remap_worker.deleteLater)
         self._asot_remap_thread.start()
 
-    def on_click_east_batch(self):
-        if not self._ensure_east_runtime_ready(
-            feature_name="EAST refinement",
-            unavailable_status=(
-                "EAST refinement is unavailable until a full EAST-main checkout and the EAST runtime dependencies are installed."
-            ),
-            show_dialog=True,
-        ):
-            return
-        if not self._ensure_east_model_paths():
-            return
-        video_dir = QFileDialog.getExistingDirectory(
-            self, "Select unlabeled video directory"
-        )
-        if not video_dir:
-            return
-        output_dir = QFileDialog.getExistingDirectory(
-            self, "Select output directory for EAST predictions"
-        )
-        if not output_dir:
-            return
-        label_txt = self._resolve_action_label_bank_path(
-            output_dir,
-            generated_file_name="east_batch_labels.txt",
-            dialog_title="Choose label bank (TXT)",
-            missing_title="Missing labels",
-            missing_text="Batch pre-labeling requires a label bank or current action labels.",
-        )
-        if not label_txt:
-            return
-        tool_path = os.path.join(self._root_dir, "tools", "east_batch_infer_adapter.py")
-        if not os.path.isfile(tool_path):
-            QMessageBox.warning(
-                self, "Missing script", f"EAST batch script not found: {tool_path}"
-            )
-            return
-
-        self._set_status("Starting batch pre-labeling with EAST...")
-        total_videos = self._count_videos_in_dir(video_dir)
-        self._close_progress_dialog(getattr(self, "_east_batch_progress", None))
-        label = "Batch pre-labeling (EAST)..."
-        if total_videos > 0:
-            label = f"Batch pre-labeling (EAST)... 0/{total_videos}"
-        self._east_batch_progress = self._open_progress_dialog(
-            "Batch Pre-labeling",
-            label,
-            total_videos if total_videos > 0 else None,
-        )
-        self._east_batch_done = 0
-        self._east_batch_current = 0
-        self._east_batch_total = total_videos if total_videos > 0 else None
-        log_path = os.path.join(output_dir, "pred_east_batch.log")
-        self._last_autolabel_log_path = log_path
-        self._east_batch_thread = QThread(self)
-        self._east_batch_worker = EASTBatchWorker(
-            video_dir=video_dir,
-            output_dir=output_dir,
-            ckpt=self._east_ckpt,
-            cfg=self._east_cfg,
-            labels_txt=label_txt,
-            category_adapter=self._effective_east_shared_adapter_path(),
-            text_bank_version=self._east_text_bank_version,
-            feature_backbone_version="east_backbone",
-            tool_path=tool_path,
-            log_path=log_path,
-        )
-        self._east_batch_worker.moveToThread(self._east_batch_thread)
-        self._east_batch_thread.started.connect(self._east_batch_worker.run)
-        self._east_batch_worker.progress.connect(self._on_east_batch_progress)
-        self._east_batch_worker.done.connect(self._on_east_batch_done)
-        self._east_batch_worker.done.connect(self._east_batch_thread.quit)
-        self._east_batch_thread.finished.connect(self._east_batch_worker.deleteLater)
-        self._east_batch_thread.start()
 
     def on_click_fact_batch(self):
         if not self._ensure_python_modules_available(
@@ -17191,33 +15323,25 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._infer_thread_asot.finished.connect(self._infer_worker_asot.deleteLater)
         self._infer_thread_asot.start()
 
-    def _start_feature_extraction(self, feat_dir: str, next_task: str, backbone: str = ""):
-        if not getattr(self, "video_path", None):
+    def _start_feature_extraction(self, feat_dir: str, next_task: str, backbone: str = ''):
+        if not getattr(self, 'video_path', None):
             QMessageBox.warning(
-                self, "No video", "Load a video before extracting features."
+                self, 'No video', 'Load a video before extracting features.'
             )
             return
         if not self._ensure_feature_extractor_available(show_dialog=True):
             return
-        self._feature_followup_task = str(next_task or "").strip().lower()
-        self._feature_followup_backbone = str(backbone or "").strip()
-        self._last_feature_error_message = ""
+        self._feature_followup_task = str(next_task or '').strip().lower()
+        self._last_feature_error_message = ''
         try:
             self.btn_auto_label_asot.setEnabled(False)
         except Exception:
             pass
-        try:
-            if self._feature_followup_task == "east":
-                self.btn_auto_label.setEnabled(False)
-        except Exception:
-            pass
-        status = "Extracting features in background..."
-        if self._feature_followup_task == "east":
-            status = "Extracting EAST backbone features in background..."
+        status = 'Extracting features in background...'
         self._set_status(status)
-        self._close_progress_dialog(getattr(self, "_feat_progress", None))
+        self._close_progress_dialog(getattr(self, '_feat_progress', None))
         self._feat_progress = self._open_progress_dialog(
-            "Feature Extraction", status, None
+            'Feature Extraction', status, None
         )
         self._feat_thread = QThread(self)
         self._feat_worker = FeatureExtractWorker(
@@ -17226,17 +15350,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             batch_size=128,
             frame_stride=1,
             use_fp16=True,
-            backbone=self._feature_followup_backbone or None,
-            east_ckpt=(
-                self._east_ckpt
-                if self._feature_followup_task in {"east", "east_bootstrap"}
-                else ""
-            ),
-            east_cfg=(
-                self._east_cfg
-                if self._feature_followup_task in {"east", "east_bootstrap"}
-                else ""
-            ),
+            backbone=str(backbone or '').strip() or None,
         )
         self._feat_worker.moveToThread(self._feat_thread)
         self._feat_thread.started.connect(self._feat_worker.run)
@@ -17250,94 +15364,32 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _start_feature_extraction_and_asot(self, feat_dir: str):
         self._start_feature_extraction(feat_dir, next_task="asot")
 
-    def _start_feature_extraction_and_east(self, feat_dir: str):
-        self._start_feature_extraction(
-            feat_dir, next_task="east", backbone="east_backbone"
-        )
 
     def _on_feat_done(self, feat_dir, ok: bool):
         try:
             self.btn_auto_label_asot.setEnabled(True)
         except Exception:
             pass
-        try:
-            self.btn_auto_label.setEnabled(True)
-        except Exception:
-            pass
-        self._close_progress_dialog(getattr(self, "_feat_progress", None))
+        self._close_progress_dialog(getattr(self, '_feat_progress', None))
         self._feat_progress = None
-        task = str(getattr(self, "_feature_followup_task", "") or "").strip().lower()
-        self._feature_followup_task = ""
-        self._feature_followup_backbone = ""
+        task = str(getattr(self, '_feature_followup_task', '') or '').strip().lower()
+        self._feature_followup_task = ''
         if not ok or not feat_dir:
-            detail = str(getattr(self, "_last_feature_error_message", "") or "").strip()
+            detail = str(getattr(self, '_last_feature_error_message', '') or '').strip()
             if detail:
-                self._set_status(f"Feature extraction failed: {detail}")
-                QMessageBox.warning(self, "Feature extraction failed", detail)
+                self._set_status(f'Feature extraction failed: {detail}')
+                QMessageBox.warning(self, 'Feature extraction failed', detail)
             else:
-                self._set_status("Feature extraction failed.")
+                self._set_status('Feature extraction failed.')
             return
-        self._last_feature_error_message = ""
+        self._last_feature_error_message = ''
         self._boundary_snap_cache = {}
-        if task == "east":
-            self.currentEastFeatureDir = feat_dir
-            self._set_status("Feature extraction finished. Starting EAST refinement...")
-            self._run_east_refinement(feat_dir)
-            return
-        if task == "east_bootstrap":
-            self.currentEastFeatureDir = feat_dir
-            records = self._rebuild_confirmed_correction_records_for_active_view()
-            persisted = self._write_correction_record_buffer(records, force=True)
-            self._update_east_runtime_meta(
-                feat_dir,
-                runtime_origin="bootstrapped",
-                bootstrap_source=str(
-                    self._active_label_baseline_source() or "CONFIRMED_SUPERVISION"
-                ).strip().upper(),
-                bootstrap_pending=False,
-                bootstrap_completed=bool(persisted),
-                bootstrap_confirmed_count=int(len(records)),
-                bootstrap_refresh_deferred=True,
-            )
-            if persisted:
-                self._set_status(
-                    "EAST runtime initialized from confirmed supervision. Starting online update..."
-                )
-                self._schedule_east_online_update(feat_dir)
-            else:
-                self._set_status(
-                    "EAST features are ready, but confirmed supervision could not be persisted."
-                )
-            return
-        if task == "east_finalize":
-            self.currentEastFeatureDir = feat_dir
-            records = list(getattr(self, "_pending_finalized_records", []) or [])
-            self._pending_finalized_records = []
-            persisted = self._write_finalized_record_buffer(records, force=True)
-            self._update_east_runtime_meta(
-                feat_dir,
-                video_finalized=bool(persisted),
-                finalized_pending=False,
-                finalized_record_count=int(len(records)),
-                finalized_at=(
-                    datetime.utcnow().isoformat(timespec="seconds") + "Z"
-                    if persisted
-                    else ""
-                ),
-            )
-            if persisted:
-                self._set_status(
-                    "Current video finalized for EAST offline supervision. Starting online update..."
-                )
-                self._schedule_east_online_update(feat_dir)
-            else:
-                self._set_status(
-                    "EAST features are ready, but finalized supervision could not be persisted."
-                )
-            return
         self.currentFeatureDir = feat_dir
-        self._set_status("Feature extraction finished. Starting ASOT pre-labeling...")
-        self.on_click_auto_label_asot()
+        if task == 'asot':
+            self._set_status('Feature extraction finished. Starting ASOT pre-labeling...')
+            self.on_click_auto_label_asot()
+            return
+        self._set_status('Feature extraction finished.')
 
     # ----- video events -----
     def _on_player_frame_advanced(self, frame: int):
@@ -17529,30 +15581,6 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         elif text.startswith("Batch Pre-label"):
             self.on_click_batch_prelabel()
-
-        elif text.startswith("EAST Setup"):
-            self._open_east_setup_dialog()
-
-        elif text.startswith("EAST: Finalize Current Video"):
-            self._finalize_current_video_for_east()
-
-        elif text.startswith("EAST: Inspect Runtime Assets"):
-            self._inspect_east_runtime_assets()
-
-        elif text.startswith("EAST: Export Runtime Report"):
-            self._export_east_runtime_report()
-
-        elif text.startswith("EAST: Export Shared Adapter"):
-            self._export_current_east_shared_adapter()
-
-        elif text.startswith("EAST: Select Shared Adapter"):
-            self._select_east_shared_adapter()
-
-        elif text.startswith("EAST: Clear Shared Adapter"):
-            self._clear_east_shared_adapter()
-
-        elif text.startswith("EAST: Consolidate Shared Adapter"):
-            self._consolidate_east_shared_adapter()
 
         elif text.startswith("Assembly State: Load Components"):
             self._load_psr_components()
@@ -18912,9 +16940,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                     pass
         self.current_annotation_path = None
         self.currentFeatureDir = None
-        self.currentEastFeatureDir = None
+        self._structured_event_graph = {}
+        self._onset_anchors = []
+        self._event_locked_regions = []
+        self._event_graph_consistency_flags = []
         self._feature_followup_task = ""
-        self._feature_followup_backbone = ""
         self._psr_clear_undo()
         # New video should always start with a clean transcript/PSR timeline state.
         # Keep rules/components/model settings, but clear per-video state edits.
@@ -21379,8 +19409,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._apply_canonical_to_store(canonical)
                 self.current_annotation_path = fp
                 self._load_extra_sidecar(fp)
-                self._set_status(
-                    f"Imported as {name}: {len(canonical.get('annotations', []))} segments"
+                self._load_structured_event_graph_sidecar(fp)
+                self._set_status(                    f"Imported as {name}: {len(canonical.get('annotations', []))} segments"
                 )
                 return True
             except Exception:
@@ -23483,6 +21513,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             "load_annotations", path=fp, segments=len(segs), labels=len(self.labels)
         )
         self._load_extra_sidecar(fp)
+        self._load_structured_event_graph_sidecar(fp)
         self._rebuild_timeline_sources()
         try:
             self.timeline.refresh_all_rows()

@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPushButton,
     QCompleter,
+    QSizePolicy,
 )
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtCore import QUrl
@@ -30,7 +31,8 @@ class VideoPlayer(QLabel):
     def __init__(self, status_cb=None, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(360)
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # --- playback state ---
         self.cap = None

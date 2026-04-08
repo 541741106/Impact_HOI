@@ -61,9 +61,10 @@ _bootstrap_qt_runtime()
 from utils.feature_env import load_feature_env_defaults  # noqa: E402
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 load_feature_env_defaults(repo_root=_REPO_ROOT)
-# Some EAST/torch kernels need this before torch-dependent modules load.
+# Some torch kernels need this before torch-dependent modules load.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-from PyQt5.QtGui import QIcon  # noqa: E402
+from PyQt5.QtCore import Qt  # noqa: E402
+from PyQt5.QtGui import QIcon, QFont, QFontDatabase  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
 from utils.op_logger import OperationLogger  # noqa: E402
@@ -79,6 +80,23 @@ def _set_windows_app_id(app_id: str) -> None:
     except Exception:
         pass
 
+
+def _configure_app_font(app: QApplication) -> None:
+    try:
+        db = QFontDatabase()
+        families = set(db.families())
+    except Exception:
+        families = set()
+    preferred = ["Segoe UI", "Microsoft YaHei UI", "Tahoma", "Arial"]
+    font = app.font()
+    for family in preferred:
+        if not families or family in families:
+            font.setFamily(family)
+            break
+    font.setStyleHint(QFont.SansSerif)
+    target_pt = 8.0 if os.name == "nt" else 8.75
+    font.setPointSizeF(target_pt)
+    app.setFont(font)
 
 def _resolve_app_icon() -> str:
     root = os.path.dirname(os.path.abspath(__file__))
@@ -102,7 +120,16 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     _set_windows_app_id("cvhci.video.annotation.impact_hoi")
+    try:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    except Exception:
+        pass
+    try:
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
+    _configure_app_font(app)
     icon_path = _resolve_app_icon()
     if icon_path:
         icon = QIcon(icon_path)

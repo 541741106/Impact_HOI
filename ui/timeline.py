@@ -99,6 +99,15 @@ class BaseTimelineRow(QWidget):
         self._timeline_ref = None
         self._edit_mask_spans: Optional[List[Tuple[int, int]]] = None
 
+    def _scaled_font(self, delta: float = 0.0, weight: int = QFont.Normal) -> QFont:
+        font = QFont(self.font())
+        size = font.pointSizeF()
+        if size <= 0:
+            size = 9.0
+        font.setPointSizeF(max(7.5, size + delta))
+        font.setWeight(weight)
+        return font
+
     def frame_to_x(self, f: int) -> int:
         g = self.get_gutter()
         span = max(1, self.get_span())
@@ -257,16 +266,39 @@ class BaseTimelineRow(QWidget):
             if step_px(s_major) >= 60:
                 sec = f // fps
                 p.setPen(QPen(QColor(90, 90, 90)))
-                p.setFont(QFont("Arial", 8))
+                p.setFont(self._scaled_font(-1.0))
                 txt = f"{sec}s"
                 w = p.fontMetrics().width(txt)
                 p.drawText(x - w // 2, 12, txt)
                 p.setPen(QPen(QColor(160, 160, 160)))
 
     def _draw_gutter_title(self, p: QPainter, text: str):
-        p.setPen(QPen(QColor(60, 60, 60)))
-        p.setFont(QFont("Arial", 9))
-        p.drawText(6, self.height() - 8, text)
+        lines = [part.strip() for part in str(text or "").splitlines() if part.strip()]
+        if not lines:
+            return
+        avail_w = max(36, int(self.get_gutter()) - 12)
+        primary_font = self._scaled_font(-0.45, QFont.DemiBold)
+        secondary_font = self._scaled_font(-1.15, QFont.Medium)
+        primary_metrics = QFontMetrics(primary_font)
+        secondary_metrics = QFontMetrics(secondary_font)
+        primary = primary_metrics.elidedText(lines[0], Qt.ElideRight, avail_w)
+        if len(lines) == 1:
+            p.setPen(QPen(QColor(52, 64, 84)))
+            p.setFont(primary_font)
+            baseline = max(10, (self.height() + primary_metrics.ascent() - primary_metrics.descent()) // 2)
+            p.drawText(6, baseline, primary)
+            return
+        secondary = secondary_metrics.elidedText(lines[1], Qt.ElideRight, avail_w)
+        total_h = primary_metrics.height() + secondary_metrics.height() - 2
+        top = max(4, (self.height() - total_h) // 2)
+        primary_baseline = top + primary_metrics.ascent()
+        secondary_baseline = top + primary_metrics.height() + secondary_metrics.ascent() - 2
+        p.setPen(QPen(QColor(52, 64, 84)))
+        p.setFont(primary_font)
+        p.drawText(6, primary_baseline, primary)
+        p.setPen(QPen(QColor(102, 112, 133)))
+        p.setFont(secondary_font)
+        p.drawText(6, secondary_baseline, secondary)
 
     def _draw_current_frame_marker(self, p: QPainter, start: int, end: int):
         if self.current_frame is None or not (start <= self.current_frame <= end):
@@ -283,7 +315,7 @@ class BaseTimelineRow(QWidget):
         x = self.frame_to_x(self._hover_frame)
         p.setPen(QPen(QColor(50, 120, 255, 180), 1, Qt.DashLine))
         p.drawLine(x, 0, x, self.height())
-        p.setFont(QFont("Arial", 8))
+        p.setFont(self._scaled_font(-1.0))
         w = p.fontMetrics().width(text) + 8
         h = p.fontMetrics().height() + 6
         rx = x + 6
@@ -1026,7 +1058,7 @@ class SubtitleRow(BaseTimelineRow):
             p.drawRoundedRect(rect, 3, 3)
             # text
             p.setPen(QPen(QColor(40, 40, 40)))
-            p.setFont(QFont("Arial", 8))
+            p.setFont(self._scaled_font(-1.0))
             metrics = p.fontMetrics()
             text = seg.text.replace("\n", " ").strip()
             # simple elide
@@ -1611,7 +1643,7 @@ class CombinedTimelineRow(BaseTimelineRow):
             p.drawRoundedRect(rect, 4, 4)
             if lb and self.show_label_text:
                 p.setPen(QPen(QColor(40, 40, 40)))
-                p.setFont(QFont("Arial", 8))
+                p.setFont(self._scaled_font(-1.0))
                 text = str(lb)
                 elided = p.fontMetrics().elidedText(
                     text, Qt.ElideRight, rect.width() - 8

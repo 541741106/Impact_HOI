@@ -18,17 +18,17 @@ class MainWindow(QWidget):
         super().__init__()
         self._app_title = "IMPACT HOI"
         self.setWindowTitle(self._app_title)
-        self.setGeometry(100, 80, 1200, 780)
+        self.setGeometry(80, 60, 1360, 860)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         try:
             screen = QApplication.primaryScreen()
             geom = screen.availableGeometry() if screen else None
             if geom:
-                min_w = min(800, max(640, geom.width() - 80))
-                min_h = min(600, max(480, geom.height() - 80))
+                min_w = min(1100, max(900, geom.width() - 180))
+                min_h = min(760, max(620, geom.height() - 180))
                 self.setMinimumSize(min_w, min_h)
-                target_w = min(1200, geom.width() - 60)
-                target_h = min(780, geom.height() - 60)
+                target_w = max(min_w, int(geom.width() * 0.94))
+                target_h = max(min_h, int(geom.height() * 0.93))
                 self.resize(max(min_w, target_w), max(min_h, target_h))
             else:
                 self.setMinimumSize(800, 600)

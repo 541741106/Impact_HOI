@@ -330,6 +330,13 @@ def logging_policy_file_path() -> str:
 def logging_policy_backup_path() -> str:
     return os.path.join(_shortcuts_dir(), "logging_policy.backup.json")
 
+def ui_preferences_file_path() -> str:
+    return os.path.join(_shortcuts_dir(), "ui_preferences.json")
+
+
+def ui_preferences_backup_path() -> str:
+    return os.path.join(_shortcuts_dir(), "ui_preferences.backup.json")
+
 
 def _definition_map() -> Dict[str, Dict[str, str]]:
     return {item["id"]: item for item in SHORTCUT_DEFINITIONS}
@@ -406,6 +413,42 @@ def default_logging_policy() -> Dict[str, bool]:
         "validation_summary_enabled": True,
         "validation_comment_prompt_enabled": True,
     }
+
+def default_ui_preferences() -> Dict[str, float]:
+    return {
+        "ui_scale": 0.85,
+    }
+
+
+def _coerce_ui_scale(value: Any, fallback: float) -> float:
+    try:
+        if isinstance(value, str):
+            text = value.strip().replace("%", "")
+            num = float(text)
+        else:
+            num = float(value)
+        if num > 10.0:
+            num = num / 100.0
+        return max(0.80, min(1.25, num))
+    except Exception:
+        try:
+            return max(0.80, min(1.25, float(fallback)))
+        except Exception:
+            return 0.85
+
+
+def _normalize_ui_preferences(
+    data: Optional[Dict[str, Any]], base: Optional[Dict[str, float]] = None
+) -> Dict[str, float]:
+    out = dict(base or default_ui_preferences())
+    if not isinstance(data, dict):
+        return out
+    obj = data
+    if isinstance(data.get("ui"), dict):
+        obj = data.get("ui") or {}
+    if "ui_scale" in obj:
+        out["ui_scale"] = _coerce_ui_scale(obj.get("ui_scale"), out["ui_scale"])
+    return out
 
 
 def _coerce_bool(value: Any, fallback: bool) -> bool:
@@ -544,6 +587,34 @@ def load_logging_policy(
     return base
 
 
+def load_ui_preferences(default_ui_scale: float = 0.85) -> Dict[str, float]:
+    base = {
+        "ui_scale": _coerce_ui_scale(default_ui_scale, 0.85),
+    }
+    for path in (ui_preferences_file_path(), ui_preferences_backup_path()):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return _normalize_ui_preferences(data, base=base)
+        except Exception:
+            continue
+
+    for path in (logging_policy_file_path(), logging_policy_backup_path()):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "ui_scale" in data:
+                return _normalize_ui_preferences(data, base=base)
+        except Exception:
+            continue
+    return base
+
+
 def save_shortcut_bindings(bindings: Dict[str, Any]) -> Tuple[bool, str]:
     payload = {
         "schema": "cvhci.shortcut_bindings.v1",
@@ -566,6 +637,21 @@ def save_logging_policy(policy: Dict[str, Any]) -> Tuple[bool, str]:
     }
     primary = logging_policy_file_path()
     backup = logging_policy_backup_path()
+    try:
+        _atomic_write_json(primary, payload)
+        _atomic_write_json(backup, payload)
+        return True, primary
+    except Exception as ex:
+        return False, str(ex)
+
+
+def save_ui_preferences(prefs: Dict[str, Any]) -> Tuple[bool, str]:
+    payload = {
+        "schema": "cvhci.ui_preferences.v1",
+        "ui": _normalize_ui_preferences(prefs),
+    }
+    primary = ui_preferences_file_path()
+    backup = ui_preferences_backup_path()
     try:
         _atomic_write_json(primary, payload)
         _atomic_write_json(backup, payload)
