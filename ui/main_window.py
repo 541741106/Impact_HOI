@@ -12,7 +12,7 @@ from utils.shortcut_settings import load_logging_policy, save_logging_policy
 
 
 class MainWindow(QWidget):
-    """Standalone host for HandOI / HOI Detection."""
+    """Standalone host for IMPACT HOI."""
 
     def __init__(self, logger: OperationLogger = None):
         super().__init__()
@@ -40,15 +40,17 @@ class MainWindow(QWidget):
             pass
 
         self.op_logger = logger or OperationLogger(False)
+        cli_forced_ops_enabled = bool(getattr(self.op_logger, "enabled", False))
         initial_logging = load_logging_policy(
-            default_ops_enabled=bool(getattr(self.op_logger, "enabled", False)),
+            default_ops_enabled=cli_forced_ops_enabled,
             default_validation_summary_enabled=True,
         )
         self._validation_summary_enabled = bool(
             initial_logging.get("validation_summary_enabled", True)
         )
-        self.op_logger.enabled = bool(initial_logging.get("ops_csv_enabled", False))
-        self.task_items = ["HandOI / HOI Detection"]
+        self.op_logger.enabled = bool(
+            cli_forced_ops_enabled or initial_logging.get("ops_csv_enabled", False)
+        )
         self.hoi_window = None
         self.placeholder = None
 
@@ -57,7 +59,7 @@ class MainWindow(QWidget):
         try:
             module = import_optional_module(
                 "ui.hoi_window",
-                feature_name="HandOI / HOI Detection",
+                feature_name="IMPACT HOI",
                 install_hint=(
                     "Install the optional HOI dependencies only if you need this task, "
                     "for example: pip install opencv-python ultralytics mediapipe torch torchvision torchaudio"
@@ -67,8 +69,6 @@ class MainWindow(QWidget):
             self.hoi_window = HOIWindow(
                 self,
                 on_close=None,
-                on_switch_task=self._on_task_changed,
-                tasks=self.task_items,
                 logger=self.op_logger,
             )
             root.addWidget(self.hoi_window)
@@ -79,18 +79,14 @@ class MainWindow(QWidget):
             )
         except MissingOptionalDependency as ex:
             self.placeholder = PlaceholderPane(
-                "HandOI / HOI Detection",
+                "IMPACT HOI",
                 format_missing_dependency_message(ex),
-                tasks=self.task_items,
-                on_switch_task=self._on_task_changed,
             )
             root.addWidget(self.placeholder)
         except Exception as ex:
             self.placeholder = PlaceholderPane(
-                "HandOI / HOI Detection",
+                "IMPACT HOI",
                 f"Failed to load the task window:\n{ex}",
-                tasks=self.task_items,
-                on_switch_task=self._on_task_changed,
             )
             root.addWidget(self.placeholder)
 
@@ -125,7 +121,15 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def _on_task_changed(self, text: str) -> None:
-        lower = (text or "").lower()
-        if ("handoi" in lower) or ("hoi" in lower):
+    def closeEvent(self, event):
+        try:
+            if self.hoi_window is not None:
+                if not self.hoi_window._confirm_close_request(prompt_parent=self):
+                    event.ignore()
+                    return
+                self.hoi_window._finalize_close_request()
+        except Exception:
+            event.ignore()
             return
+        return super().closeEvent(event)
+

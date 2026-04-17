@@ -6,313 +6,100 @@ from typing import Dict, List, Optional, Tuple, Any
 
 
 SHORTCUT_DEFINITIONS: List[Dict[str, str]] = [
-    # --- Action Segmentation: General ---
-    {
-        "id": "action.play_pause",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Play / Pause",
-        "default": "Space",
-    },
-    {
-        "id": "action.step_prev",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Step frame -1",
-        "default": "A",
-    },
-    {
-        "id": "action.step_next",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Step frame +1",
-        "default": "D",
-    },
-    {
-        "id": "action.step_prev_fast",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Step frame -10",
-        "default": "Shift+A",
-    },
-    {
-        "id": "action.step_next_fast",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Step frame +10",
-        "default": "Shift+D",
-    },
-    {
-        "id": "action.seek_back_1s",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Seek -1 second",
-        "default": "J",
-    },
-    {
-        "id": "action.pause",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Pause",
-        "default": "K",
-    },
-    {
-        "id": "action.seek_fwd_1s",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Seek +1 second",
-        "default": "L",
-    },
-    {
-        "id": "action.jump_start",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Jump to crop start",
-        "default": "Home",
-    },
-    {
-        "id": "action.jump_end",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Jump to crop end",
-        "default": "End",
-    },
-    {
-        "id": "action.undo",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Undo",
-        "default": "Ctrl+Z",
-    },
-    {
-        "id": "action.redo",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Redo",
-        "default": "Ctrl+Y",
-    },
-    {
-        "id": "action.adjust_uncertainty",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Adjust uncertainty margin",
-        "default": "Ctrl+Shift+U",
-    },
-    {
-        "id": "action.open_settings",
-        "section": "Action Segmentation",
-        "scope": "action_general",
-        "label": "Open settings",
-        "default": "Ctrl+,",
-    },
-    # --- Action Segmentation: Review ---
-    {
-        "id": "action.review_prev",
-        "section": "Action Review",
-        "scope": "action_review",
-        "label": "Previous review item",
-        "default": "Left",
-    },
-    {
-        "id": "action.review_next",
-        "section": "Action Review",
-        "scope": "action_review",
-        "label": "Next review item",
-        "default": "Right",
-    },
-    # --- Action Segmentation: Assisted ---
-    {
-        "id": "action.assist_nudge_left",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Nudge boundary left",
-        "default": "Left",
-    },
-    {
-        "id": "action.assist_nudge_right",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Nudge boundary right",
-        "default": "Right",
-    },
-    {
-        "id": "action.assist_confirm",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Confirm boundary",
-        "default": "S",
-    },
-    {
-        "id": "action.assist_confirm_down",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Confirm boundary (Down)",
-        "default": "Down",
-    },
-    {
-        "id": "action.assist_prev",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Previous assisted point",
-        "default": "P",
-    },
-    {
-        "id": "action.assist_next",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Next assisted point",
-        "default": "N",
-    },
-    {
-        "id": "action.assist_skip",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Skip assisted point",
-        "default": "X",
-    },
-    {
-        "id": "action.assist_merge",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Merge boundary",
-        "default": "Backspace",
-    },
-    {
-        "id": "action.assist_merge_delete",
-        "section": "Action Assisted Review",
-        "scope": "action_assisted",
-        "label": "Merge boundary (Delete)",
-        "default": "Delete",
-    },
     # --- HOI ---
     {
         "id": "hoi.step_prev",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Step frame -1",
         "default": "Left",
     },
     {
         "id": "hoi.step_next",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Step frame +1",
         "default": "Right",
     },
     {
         "id": "hoi.seek_prev_second",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Seek -1 second",
         "default": "Up",
     },
     {
         "id": "hoi.seek_next_second",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Seek +1 second",
         "default": "Down",
     },
     {
         "id": "hoi.play_pause",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Play / Pause",
         "default": "Space",
     },
     {
         "id": "hoi.pause",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Pause",
         "default": "K",
     },
     {
         "id": "hoi.detect",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Detect current frame",
         "default": "Ctrl+Shift+D",
     },
     {
+        "id": "hoi.toggle_edit_boxes",
+        "section": "IMPACT HOI",
+        "scope": "hoi",
+        "label": "Toggle box edit mode",
+        "default": "Ctrl+B",
+    },
+    {
         "id": "hoi.undo",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Undo",
         "default": "Ctrl+Z",
     },
     {
         "id": "hoi.redo",
-        "section": "HandOI / HOI Detection",
+        "section": "IMPACT HOI",
         "scope": "hoi",
         "label": "Redo",
         "default": "Ctrl+Y",
     },
-    # --- PSR ---
     {
-        "id": "psr.undo",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Undo",
-        "default": "Ctrl+Z",
+        "id": "hoi.open_settings",
+        "section": "IMPACT HOI",
+        "scope": "hoi",
+        "label": "Open settings",
+        "default": "Ctrl+,",
     },
     {
-        "id": "psr.redo",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Redo",
-        "default": "Ctrl+Y",
-    },
-    {
-        "id": "psr.split_at_playhead",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Split segment at playhead",
-        "default": "Ctrl+K",
-    },
-    {
-        "id": "psr.scope_segment",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Set scope to segment",
-        "default": "Ctrl+Shift+S",
-    },
-    {
-        "id": "psr.scope_from_here",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Set scope to from-here",
-        "default": "Ctrl+Shift+F",
-    },
-    {
-        "id": "psr.reset_segment",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Reset selected segment",
-        "default": "Ctrl+Backspace",
-    },
-    {
-        "id": "psr.invert_segment",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Invert selected segment",
-        "default": "Ctrl+I",
-    },
-    {
-        "id": "psr.merge_identical",
-        "section": "PSR/ASR/ASD",
-        "scope": "psr",
-        "label": "Merge adjacent identical states",
-        "default": "Ctrl+M",
+        "id": "hoi.open_quick_start",
+        "section": "IMPACT HOI",
+        "scope": "hoi",
+        "label": "Open quick start",
+        "default": "F1",
     },
 ]
 
 
 def _shortcuts_dir() -> str:
-    base = os.environ.get("CVHCI_SETTINGS_DIR")
+    base = os.environ.get("IMPACT_HOI_SETTINGS_DIR") or os.environ.get("CVHCI_SETTINGS_DIR")
     if base:
         return os.path.abspath(base)
-    return os.path.join(os.path.expanduser("~"), ".cvhci_video_annotation_suite")
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".impact_hoi")
 
 
 def shortcuts_file_path() -> str:
@@ -414,9 +201,11 @@ def default_logging_policy() -> Dict[str, bool]:
         "validation_comment_prompt_enabled": True,
     }
 
-def default_ui_preferences() -> Dict[str, float]:
+def default_ui_preferences() -> Dict[str, Any]:
     return {
         "ui_scale": 0.85,
+        "show_quick_start_on_startup": True,
+        "participant_code": "",
     }
 
 
@@ -438,8 +227,8 @@ def _coerce_ui_scale(value: Any, fallback: float) -> float:
 
 
 def _normalize_ui_preferences(
-    data: Optional[Dict[str, Any]], base: Optional[Dict[str, float]] = None
-) -> Dict[str, float]:
+    data: Optional[Dict[str, Any]], base: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     out = dict(base or default_ui_preferences())
     if not isinstance(data, dict):
         return out
@@ -448,6 +237,13 @@ def _normalize_ui_preferences(
         obj = data.get("ui") or {}
     if "ui_scale" in obj:
         out["ui_scale"] = _coerce_ui_scale(obj.get("ui_scale"), out["ui_scale"])
+    if "show_quick_start_on_startup" in obj:
+        out["show_quick_start_on_startup"] = _coerce_bool(
+            obj.get("show_quick_start_on_startup"),
+            out["show_quick_start_on_startup"],
+        )
+    if "participant_code" in obj:
+        out["participant_code"] = str(obj.get("participant_code") or "").strip()
     return out
 
 
@@ -587,7 +383,7 @@ def load_logging_policy(
     return base
 
 
-def load_ui_preferences(default_ui_scale: float = 0.85) -> Dict[str, float]:
+def load_ui_preferences(default_ui_scale: float = 0.85) -> Dict[str, Any]:
     base = {
         "ui_scale": _coerce_ui_scale(default_ui_scale, 0.85),
     }

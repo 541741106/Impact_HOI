@@ -1,6 +1,6 @@
 import cv2
 from PyQt5.QtCore import Qt, QTimer, QRect
-from PyQt5.QtGui import QImage, QPainter, QColor, QFont, QPen
+from PyQt5.QtGui import QImage, QPainter, QColor, QFont, QPen, QFontMetrics
 from PyQt5.QtWidgets import (
     QLabel,
     QToolButton,
@@ -109,10 +109,14 @@ class VideoPlayer(QLabel):
         self.overlay_bars = []
         # box editing state
         self.edit_enabled = False
+        self.edit_add_enabled = False
         self.edit_boxes = []
         self.edit_callback = None
+        self.edit_select_callback = None
+        self.edit_materialize_callback = None
         self.edit_label_resolver = None
         self.edit_label_suggestions = []
+        self.edit_selected_box = None
         self._edit_active = None  # (box dict, mode)
         self._edit_anchor = None  # (x, y) image coords at press
         self._edit_add_active = False
@@ -547,7 +551,7 @@ class VideoPlayer(QLabel):
             self.update()
 
     def set_overlay_boxes(self, boxes):
-        """boxes: list of dicts with x1,y1,x2,y2,label,color"""
+        """boxes: list of dicts with x1,y1,x2,y2,label,color[,dashed][,thick]"""
         self.overlay_boxes = list(boxes or [])
         self.update()
 
@@ -567,17 +571,32 @@ class VideoPlayer(QLabel):
         self,
         boxes,
         on_change=None,
+        on_select=None,
+        on_materialize=None,
         label_resolver=None,
         label_suggestions=None,
         auto_label_fetcher=None,
+        allow_add=None,
+        allow_edit=None,
+        selected_box=None,
     ):
         """Enable editing for the given boxes (list of dict with id/x1/y1/x2/y2/label).
         label_resolver(name:str)->(label, class_id, known:bool) maps ids/names to labels.
         auto_label_fetcher()->(label, class_id) can prefill a new box label.
         """
+        callback_enabled = bool(on_change)
+        if allow_add is None:
+            allow_add = callback_enabled
+        if allow_edit is None:
+            allow_edit = callback_enabled
         self.edit_boxes = list(boxes or [])
-        self.edit_enabled = bool(on_change)
-        self.edit_callback = on_change
+        self.edit_enabled = bool(callback_enabled and allow_edit)
+        self.edit_add_enabled = bool(callback_enabled and allow_add)
+        self.edit_callback = on_change if callback_enabled else None
+        self.edit_select_callback = on_select if callable(on_select) else None
+        self.edit_materialize_callback = (
+            on_materialize if callable(on_materialize) else None
+        )
         self.edit_label_resolver = label_resolver
         self.edit_label_suggestions = list(label_suggestions or [])
         self.edit_auto_label_fetcher = auto_label_fetcher
@@ -585,7 +604,179 @@ class VideoPlayer(QLabel):
         self._edit_anchor = None
         self._edit_add_active = False
         self._edit_add_origin = None
+        self._set_selected_edit_box(selected_box, notify=False)
         self.update()
+
+    @staticmethod
+    def _box_identity(box):
+        if not isinstance(box, dict):
+            return ()
+        frame_key = box.get("orig_frame", box.get("frame"))
+        try:
+            frame_key = int(frame_key) if frame_key is not None else None
+        except Exception:
+            frame_key = None
+        return (
+            box.get("id"),
+            frame_key,
+            round(float(box.get("x1", 0.0) or 0.0), 1),
+            round(float(box.get("y1", 0.0) or 0.0), 1),
+            round(float(box.get("x2", 0.0) or 0.0), 1),
+            round(float(box.get("y2", 0.0) or 0.0), 1),
+        )
+
+    def _same_box(self, box_a, box_b) -> bool:
+        if not isinstance(box_a, dict) or not isinstance(box_b, dict):
+            return False
+        id_a = box_a.get("id")
+        id_b = box_b.get("id")
+        if id_a is not None and id_b is not None and id_a != id_b:
+            return False
+        frame_a = box_a.get("orig_frame", box_a.get("frame"))
+        frame_b = box_b.get("orig_frame", box_b.get("frame"))
+        try:
+            frame_a = int(frame_a) if frame_a is not None else None
+        except Exception:
+            frame_a = None
+        try:
+            frame_b = int(frame_b) if frame_b is not None else None
+        except Exception:
+            frame_b = None
+        if frame_a is not None and frame_b is not None and frame_a != frame_b:
+            return False
+        for key in ("x1", "y1", "x2", "y2"):
+            try:
+                va = float(box_a.get(key, 0.0) or 0.0)
+                vb = float(box_b.get(key, 0.0) or 0.0)
+            except Exception:
+                return False
+            if abs(va - vb) > 2.0:
+                return False
+        return True
+
+    def _set_selected_edit_box(self, box, *, notify=True):
+        selected = None
+        if isinstance(box, dict):
+            target = self._box_identity(box)
+            for candidate in list(self.edit_boxes or []):
+                if self._box_identity(candidate) == target:
+                    selected = candidate
+                    break
+            if selected is None:
+                selected = dict(box)
+        changed = not self._same_box(self.edit_selected_box, selected)
+        self.edit_selected_box = selected
+        if changed and notify and callable(self.edit_select_callback):
+            try:
+                self.edit_select_callback(dict(selected) if isinstance(selected, dict) else None)
+            except Exception:
+                pass
+
+    def _box_screen_rect(self, box):
+        if not isinstance(box, dict) or not hasattr(self, "_last_draw_rect"):
+            return None
+        x, y, w, h = self._last_draw_rect
+        if w <= 0 or h <= 0 or self._frame_w <= 0 or self._frame_h <= 0:
+            return None
+        sx = float(w) / float(self._frame_w)
+        sy = float(h) / float(self._frame_h)
+        try:
+            dx1 = int(round(x + float(box.get("x1", 0.0) or 0.0) * sx))
+            dy1 = int(round(y + float(box.get("y1", 0.0) or 0.0) * sy))
+            dx2 = int(round(x + float(box.get("x2", 0.0) or 0.0) * sx))
+            dy2 = int(round(y + float(box.get("y2", 0.0) or 0.0) * sy))
+        except Exception:
+            return None
+        return QRect(dx1, dy1, max(1, dx2 - dx1), max(1, dy2 - dy1))
+
+    def _label_hit_rect_for_box(self, box):
+        rect = self._box_screen_rect(box)
+        if rect is None:
+            return None
+        label = str(box.get("label", "") or "").strip()
+        if not label:
+            return None
+        font = QFont("Arial", 10)
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        try:
+            tw = metrics.horizontalAdvance(label) + 6
+        except AttributeError:
+            tw = metrics.width(label) + 6
+        th = metrics.height() + 4
+        px = rect.left()
+        py = max(0, rect.top() - th)
+        return QRect(px, py, tw, th)
+
+    def _hit_box_candidates(self, ix, iy, sx=None, sy=None):
+        if not self.edit_boxes:
+            return []
+        candidates = []
+        handle_size = 10
+        for box in reversed(self.edit_boxes):
+            x1, y1, x2, y2 = (
+                float(box.get("x1", 0.0) or 0.0),
+                float(box.get("y1", 0.0) or 0.0),
+                float(box.get("x2", 0.0) or 0.0),
+                float(box.get("y2", 0.0) or 0.0),
+            )
+            if sx is not None and sy is not None:
+                label_rect = self._label_hit_rect_for_box(box)
+                if label_rect is not None and label_rect.contains(int(sx), int(sy)):
+                    candidates.append((box, "select"))
+                    continue
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            handles = {
+                "tl": (x1, y1),
+                "t": (cx, y1),
+                "tr": (x2, y1),
+                "l": (x1, cy),
+                "r": (x2, cy),
+                "bl": (x1, y2),
+                "b": (cx, y2),
+                "br": (x2, y2),
+            }
+            hit_mode = None
+            for name, (hx, hy) in handles.items():
+                if abs(ix - hx) <= handle_size and abs(iy - hy) <= handle_size:
+                    hit_mode = name
+                    break
+            if hit_mode is not None:
+                candidates.append((box, hit_mode))
+                continue
+            if x1 <= ix <= x2 and y1 <= iy <= y2:
+                candidates.append((box, "move"))
+        return candidates
+
+    def _hit_overlay_box_candidates(self, ix, iy, sx=None, sy=None, predicate=None):
+        if not self.overlay_boxes:
+            return []
+        candidates = []
+        for box in reversed(self.overlay_boxes):
+            if not isinstance(box, dict):
+                continue
+            if callable(predicate):
+                try:
+                    if not predicate(box):
+                        continue
+                except Exception:
+                    continue
+            try:
+                x1 = float(box.get("x1", 0.0) or 0.0)
+                y1 = float(box.get("y1", 0.0) or 0.0)
+                x2 = float(box.get("x2", 0.0) or 0.0)
+                y2 = float(box.get("y2", 0.0) or 0.0)
+            except Exception:
+                continue
+            if sx is not None and sy is not None:
+                label_rect = self._label_hit_rect_for_box(box)
+                if label_rect is not None and label_rect.contains(int(sx), int(sy)):
+                    candidates.append(dict(box))
+                    continue
+            if x1 <= ix <= x2 and y1 <= iy <= y2:
+                candidates.append(dict(box))
+        return candidates
 
     # ========== painting ==========
     def paintEvent(self, e):
@@ -600,7 +791,10 @@ class VideoPlayer(QLabel):
         sx = float(w) / float(src_w)
         sy = float(h) / float(src_h)
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setRenderHint(
+            QPainter.SmoothPixmapTransform,
+            bool(not self.is_playing and self._zoom > 1.0),
+        )
         p.drawImage(
             QRect(
                 int(round(x)),
@@ -629,9 +823,11 @@ class VideoPlayer(QLabel):
                 dx2 = int(round(x + x2 * sx))
                 dy2 = int(round(y + y2 * sy))
                 pen = QColor(color)
-                pen.setAlpha(220)
-                width = 4 if box.get("thick") else 2
-                p.setPen(QPen(pen, width))
+                pen.setAlpha(int(box.get("alpha", 220) or 220))
+                selected = bool(box.get("selected"))
+                width = 5 if selected else (4 if box.get("thick") else 2)
+                line_style = Qt.DashLine if box.get("dashed") else Qt.SolidLine
+                p.setPen(QPen(pen, width, line_style))
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(dx1, dy1, max(1, dx2 - dx1), max(1, dy2 - dy1))
                 if lbl:
@@ -647,11 +843,11 @@ class VideoPlayer(QLabel):
                     px = dx1
                     py = max(int(round(y)), dy1 - th)
                     bg = QColor(color)
-                    bg.setAlpha(140)
+                    bg.setAlpha(int(box.get("label_alpha", 180 if selected else 140) or (180 if selected else 140)))
                     p.fillRect(px, py, tw, th, bg)
                     p.setPen(QColor(255, 255, 255))
                     p.drawText(px + 3, py + th - 4, lbl)
-                if self.edit_enabled:
+                if self.edit_enabled and selected and not bool(box.get("locked")):
                     handle = 6
                     cx = (dx1 + dx2) // 2
                     cy = (dy1 + dy2) // 2
@@ -882,40 +1078,10 @@ class VideoPlayer(QLabel):
         iy = (py - y) * sy
         return ix, iy
 
-    def _hit_box(self, ix, iy):
-        if not self.edit_boxes:
-            return None, None
-        handle_size = 10
-        for box in reversed(self.edit_boxes):
-            x1, y1, x2, y2 = (
-                box.get("x1", 0),
-                box.get("y1", 0),
-                box.get("x2", 0),
-                box.get("y2", 0),
-            )
-            # determine handle hits
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            handles = {
-                "tl": (x1, y1),
-                "t": (cx, y1),
-                "tr": (x2, y1),
-                "l": (x1, cy),
-                "r": (x2, cy),
-                "bl": (x1, y2),
-                "b": (cx, y2),
-                "br": (x2, y2),
-            }
-            for name, (hx, hy) in handles.items():
-                if abs(ix - hx) <= handle_size and abs(iy - hy) <= handle_size:
-                    return box, name
-            # fallback to body hit
-            if x1 <= ix <= x2 and y1 <= iy <= y2:
-                return box, "move"
-        return None, None
-
     @staticmethod
     def _cursor_for_mode(mode: str):
+        if mode == "select":
+            return Qt.PointingHandCursor
         if mode in ("l", "r"):
             return Qt.SizeHorCursor
         if mode in ("t", "b"):
@@ -943,7 +1109,7 @@ class VideoPlayer(QLabel):
             except Exception:
                 cid_val = None
             manual_label, ok_name = QInputDialog.getText(
-                self, "New label", f"Label for id {cid_val}:"
+                self, "New label", "Label for new manual box:"
             )
             if not ok_name or not manual_label.strip():
                 return None
@@ -969,7 +1135,7 @@ class VideoPlayer(QLabel):
 
         # --- add new box (HOI) ---
         if (
-            self.edit_enabled
+            self.edit_add_enabled
             and e.button() == Qt.LeftButton
             and (e.modifiers() & Qt.ControlModifier)
             and self._last_qimage is not None
@@ -985,8 +1151,13 @@ class VideoPlayer(QLabel):
         if self.edit_enabled and e.button() == Qt.RightButton:
             mapped = self._screen_to_image(e.x(), e.y())
             if mapped:
-                bx, _ = self._hit_box(mapped[0], mapped[1])
+                candidates = self._hit_box_candidates(mapped[0], mapped[1], e.x(), e.y())
+                bx, _ = candidates[0] if candidates else (None, None)
+                if bx and bool(bx.get("locked")):
+                    e.accept()
+                    return
                 if bx and callable(self.edit_callback):
+                    self._set_selected_edit_box(bx)
                     payload = dict(bx)
                     payload["_action"] = "delete"
                     try:
@@ -1002,10 +1173,66 @@ class VideoPlayer(QLabel):
             pos = e.pos()
             mapped = self._screen_to_image(pos.x(), pos.y())
             if mapped:
-                bx, mode = self._hit_box(mapped[0], mapped[1])
-                if bx:
-                    self._edit_active = {"box": bx, "mode": mode}
-                    self._edit_anchor = mapped
+                candidates = self._hit_box_candidates(mapped[0], mapped[1], pos.x(), pos.y())
+                if candidates:
+                    selected_candidate = None
+                    for cand_box, cand_mode in candidates:
+                        if self._same_box(self.edit_selected_box, cand_box):
+                            selected_candidate = (cand_box, cand_mode)
+                            break
+                    if selected_candidate is not None and selected_candidate[1] != "select":
+                        bx, mode = selected_candidate
+                        self._set_selected_edit_box(bx)
+                        self.update()
+                        if bool(bx.get("locked")):
+                            e.accept()
+                            return
+                        self._edit_active = {"box": bx, "mode": mode}
+                        self._edit_anchor = mapped
+                        e.accept()
+                        return
+                    bx, _mode = candidates[0]
+                    self._set_selected_edit_box(bx)
+                    self.update()
+                    e.accept()
+                    return
+                overlay_candidates = self._hit_overlay_box_candidates(
+                    mapped[0],
+                    mapped[1],
+                    pos.x(),
+                    pos.y(),
+                    predicate=lambda box: bool(box.get("synthetic")),
+                )
+                overlay_box = overlay_candidates[0] if overlay_candidates else None
+                if overlay_box and callable(self.edit_materialize_callback):
+                    materialized = None
+                    try:
+                        materialized = self.edit_materialize_callback(dict(overlay_box))
+                    except Exception:
+                        materialized = None
+                    if isinstance(materialized, dict):
+                        self._set_selected_edit_box(materialized)
+                        remapped_candidates = self._hit_box_candidates(
+                            mapped[0], mapped[1], pos.x(), pos.y()
+                        )
+                        chosen = None
+                        for cand_box, cand_mode in remapped_candidates:
+                            if self._same_box(self.edit_selected_box, cand_box):
+                                chosen = (cand_box, cand_mode)
+                                break
+                        if chosen is None and remapped_candidates:
+                            chosen = remapped_candidates[0]
+                        if chosen is not None:
+                            bx, mode = chosen
+                            self._set_selected_edit_box(bx)
+                            self.update()
+                            if not bool(bx.get("locked")):
+                                if mode == "select":
+                                    mode = "move"
+                                self._edit_active = {"box": bx, "mode": mode}
+                                self._edit_anchor = mapped
+                        else:
+                            self.update()
                     e.accept()
                     return
 
@@ -1035,7 +1262,7 @@ class VideoPlayer(QLabel):
 
     def mouseMoveEvent(self, e):
         if (
-            self.edit_enabled
+            self.edit_add_enabled
             and self._edit_add_active
             and (e.buttons() & Qt.LeftButton)
         ):
@@ -1096,8 +1323,12 @@ class VideoPlayer(QLabel):
         elif self.edit_enabled:
             mapped = self._screen_to_image(e.x(), e.y())
             if mapped:
-                _, mode = self._hit_box(mapped[0], mapped[1])
-                self.setCursor(self._cursor_for_mode(mode))
+                candidates = self._hit_box_candidates(mapped[0], mapped[1], e.x(), e.y())
+                bx, mode = candidates[0] if candidates else (None, None)
+                if bx and bool(bx.get("locked")):
+                    self.setCursor(Qt.ArrowCursor)
+                else:
+                    self.setCursor(self._cursor_for_mode(mode))
             else:
                 self.setCursor(Qt.ArrowCursor)
 
@@ -1115,7 +1346,7 @@ class VideoPlayer(QLabel):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if self.edit_enabled and self._edit_add_active and e.button() == Qt.LeftButton:
+        if self.edit_add_enabled and self._edit_add_active and e.button() == Qt.LeftButton:
             rect = QRect(self._edit_add_origin or e.pos(), e.pos()).normalized()
             self._edit_add_active = False
             self._edit_add_origin = None
@@ -1196,8 +1427,17 @@ class VideoPlayer(QLabel):
             if (not self._drag_moved) and callable(
                 getattr(self, "on_click_frame", None)
             ):
+                mapped = self._screen_to_image(e.x(), e.y())
                 try:
-                    self.on_click_frame(self.current_frame)
+                    if mapped:
+                        self.on_click_frame(self.current_frame, mapped[0], mapped[1])
+                    else:
+                        self.on_click_frame(self.current_frame, None, None)
+                except TypeError:
+                    try:
+                        self.on_click_frame(self.current_frame)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             e.accept()
@@ -1209,8 +1449,13 @@ class VideoPlayer(QLabel):
         if self.edit_enabled and e.button() == Qt.LeftButton:
             mapped = self._screen_to_image(e.x(), e.y())
             if mapped:
-                bx, _ = self._hit_box(mapped[0], mapped[1])
+                candidates = self._hit_box_candidates(mapped[0], mapped[1], e.x(), e.y())
+                bx, _ = candidates[0] if candidates else (None, None)
                 if bx:
+                    self._set_selected_edit_box(bx)
+                    if bool(bx.get("locked")):
+                        e.accept()
+                        return
                     dlg = self._rename_dialog(str(bx.get("label", "")))
                     if dlg.exec_() == QDialog.Accepted:
                         resolved = self._resolve_label_input(dlg)
@@ -1254,7 +1499,6 @@ class VideoPlayer(QLabel):
 
         def update_hint(txt):
             lbl = ""
-            cid = None
             known = False
             if callable(self.edit_label_resolver):
                 try:
@@ -1262,8 +1506,6 @@ class VideoPlayer(QLabel):
                     if isinstance(res, tuple):
                         if len(res) >= 1:
                             lbl = res[0] or ""
-                        if len(res) >= 2:
-                            cid = res[1]
                         if len(res) >= 3:
                             known = bool(res[2])
                     else:
@@ -1271,17 +1513,17 @@ class VideoPlayer(QLabel):
                 except Exception:
                     lbl = ""
             if known:
-                hint.setText(f"-> {lbl} (id={cid})" if cid is not None else f"-> {lbl}")
+                hint.setText(f"-> {lbl}")
             elif txt and txt.isdigit():
-                hint.setText(f"New id {txt} (not in class list)")
+                hint.setText(f"Noun/Object id {txt} not found in the current library")
             elif lbl and (lbl != txt):
                 hint.setText(f"-> {lbl}")
             else:
-                hint.setText("Enter class id or name; new ids will be added")
+                hint.setText("Enter noun/object id or name")
 
         self_line.textChanged.connect(update_hint)
         update_hint(current)
-        v.addWidget(QLabel("Enter class id or name:"))
+        v.addWidget(QLabel("Enter noun/object id or name:"))
         v.addWidget(self_line)
         v.addWidget(hint)
         btns = QHBoxLayout()

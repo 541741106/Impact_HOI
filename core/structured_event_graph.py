@@ -5,7 +5,15 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+FIELD_TO_ENTRY_KEY = {
+    "interaction_start": "start_frame",
+    "functional_contact_onset": "contact_onset_frame",
+    "interaction_end": "end_frame",
+    "verb": "verb",
+    "noun_object_id": "noun_object_id",
+}
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -111,8 +119,7 @@ def _has_event_content(entry: Dict[str, Any]) -> bool:
             "start_frame",
             "contact_onset_frame",
             "end_frame",
-            "instrument_object_id",
-            "target_object_id",
+            "noun_object_id",
         )
     ) or bool(_safe_text(entry.get("verb", "")))
 
@@ -125,13 +132,62 @@ def _defined_frames(entry: Dict[str, Any]) -> List[int]:
             frames.append(int(value))
     return frames
 
+
+def _field_value_is_empty(field_name: str, value: Any) -> bool:
+    if field_name == "verb":
+        return not _safe_text(value)
+    return _safe_int(value) is None if field_name != "verb" else not _safe_text(value)
+
+
+def _normalized_field_status(entry: Dict[str, Any], field_name: str) -> str:
+    field_state = dict((entry.get("field_state") or {}).get(field_name) or {})
+    if not field_state and field_name == "noun_object_id":
+        field_state = dict((entry.get("field_state") or {}).get("target_object_id") or {})
+    status = _safe_text(field_state.get("status")).lower()
+    value_key = FIELD_TO_ENTRY_KEY.get(field_name, field_name)
+    value = entry.get(value_key)
+    if status in {"missing", "empty"}:
+        return "missing"
+    if status in {"confirmed", "suggested"}:
+        return status
+    return "missing" if _field_value_is_empty(field_name, value) else "confirmed"
+
+
+def _event_confirmation_kind(entry: Dict[str, Any]) -> str:
+    statuses = {
+        field_name: _normalized_field_status(entry, field_name)
+        for field_name in FIELD_TO_ENTRY_KEY.keys()
+    }
+    if all(status == "confirmed" for status in statuses.values()):
+        return "confirmed"
+    if any(status == "confirmed" for status in statuses.values()) or any(
+        status == "suggested" for status in statuses.values()
+    ):
+        return "partial"
+    return "unresolved"
+
+
+def _confirmed_temporal_frames(entry: Dict[str, Any]) -> List[int]:
+    frames: List[int] = []
+    for field_name, entry_key in (
+        ("interaction_start", "start_frame"),
+        ("functional_contact_onset", "contact_onset_frame"),
+        ("interaction_end", "end_frame"),
+    ):
+        if _normalized_field_status(entry, field_name) != "confirmed":
+            continue
+        value = _safe_int(entry.get(entry_key))
+        if value is not None:
+            frames.append(int(value))
+    return frames
+
 def _event_consistency_flags(entry: Dict[str, Any]) -> List[str]:
     flags: List[str] = []
     start = _safe_int(entry.get("start_frame"))
     onset = _safe_int(entry.get("contact_onset_frame"))
     end = _safe_int(entry.get("end_frame"))
     verb = _safe_text(entry.get("verb", ""))
-    has_objects = entry.get("instrument_object_id") is not None or entry.get("target_object_id") is not None
+    has_objects = entry.get("noun_object_id") is not None
 
     if start is not None and end is not None and start > end:
         flags.append("start_after_end")
@@ -158,6 +214,8 @@ def build_hoi_event_graph(
     onset_anchors: List[Dict[str, Any]] = []
     locked_regions: List[Dict[str, Any]] = []
     consistency_flags: List[Dict[str, Any]] = []
+    field_state_counts = {"confirmed": 0, "suggested": 0, "missing": 0, "other": 0}
+    field_source_counts: Dict[str, int] = {}
 
     for idx, event in enumerate(list(events or [])):
         if not isinstance(event, dict):
@@ -177,6 +235,7 @@ def build_hoi_event_graph(
             start_frame = _safe_int(hand.get("interaction_start"))
             onset_frame = _safe_int(hand.get("functional_contact_onset"))
             end_frame = _safe_int(hand.get("interaction_end"))
+            noun_object_id = _safe_int(hand.get("noun_object_id", hand.get("target_object_id")))
             entry = {
                 "event_id": int(event_id),
                 "hand": actor_id,
@@ -187,12 +246,11 @@ def build_hoi_event_graph(
                 "contact_onset_frame": onset_frame,
                 "end_frame": end_frame,
                 "verb": _safe_text(hand.get("verb", "")),
-                "instrument_object_id": _safe_int(hand.get("instrument_object_id")),
-                "target_object_id": _safe_int(hand.get("target_object_id")),
-                "anomaly_label": _safe_text(hand.get("anomaly_label", "")) or "Normal",
+                "target_object_id": noun_object_id,
+                "noun_object_id": noun_object_id,
                 "source_task": "hoi",
-                "confirmed_kind": "confirmed",
-                "locked": True,
+                "confirmed_kind": "unresolved",
+                "locked": False,
                 "field_state": _normalize_annotation_state(hand.get("_field_state")),
                 "field_suggestions": _normalize_annotation_state(
                     hand.get("_field_suggestions")
@@ -224,9 +282,26 @@ def build_hoi_event_graph(
             flags = _event_consistency_flags(entry)
             entry["consistency_flags"] = list(flags)
             entry["has_consistency_issue"] = bool(flags)
+            entry["confirmed_kind"] = _event_confirmation_kind(entry)
+            entry["locked"] = entry["confirmed_kind"] == "confirmed"
+
+            for _field_name, state_row in list((entry.get("field_state") or {}).items()):
+                if not isinstance(state_row, dict):
+                    continue
+                status = _safe_text(state_row.get("status")).lower() or "other"
+                source = _safe_text(state_row.get("source")).lower() or "unknown"
+                if status in {"empty", "missing"}:
+                    status = "missing"
+                if status not in field_state_counts:
+                    status = "other"
+                field_state_counts[status] = int(field_state_counts.get(status, 0) or 0) + 1
+                field_source_counts[source] = int(field_source_counts.get(source, 0) or 0) + 1
             graph_events.append(entry)
 
             if onset_frame is not None:
+                onset_locked = _normalized_field_status(
+                    entry, "functional_contact_onset"
+                ) == "confirmed"
                 onset_anchors.append(
                     {
                         "event_id": int(event_id),
@@ -237,15 +312,15 @@ def build_hoi_event_graph(
                         "start_frame": start_frame,
                         "end_frame": end_frame,
                         "verb": entry["verb"],
-                        "instrument_object_id": entry["instrument_object_id"],
                         "target_object_id": entry["target_object_id"],
-                        "locked": True,
+                        "noun_object_id": entry["noun_object_id"],
+                        "locked": bool(onset_locked),
                         "anchor_type": "contact_onset",
                         "source_task": "hoi",
                     }
                 )
 
-            frames = _defined_frames(entry)
+            frames = _confirmed_temporal_frames(entry)
             if frames:
                 locked_regions.append(
                     {
@@ -302,6 +377,8 @@ def build_hoi_event_graph(
             "sparse_evidence_missing_count": int(
                 sum(int(item.get("sparse_evidence_missing_count", 0) or 0) for item in graph_events)
             ),
+            "field_state_counts": dict(field_state_counts),
+            "field_source_counts": dict(sorted(field_source_counts.items())),
         },
     }
 
@@ -354,8 +431,8 @@ def extract_onset_anchors(graph: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "start_frame": _safe_int(item.get("start_frame")),
                 "end_frame": _safe_int(item.get("end_frame")),
                 "verb": _safe_text(item.get("verb", "")),
-                "instrument_object_id": _safe_int(item.get("instrument_object_id")),
                 "target_object_id": _safe_int(item.get("target_object_id")),
+                "noun_object_id": _safe_int(item.get("noun_object_id", item.get("target_object_id"))),
                 "locked": bool(item.get("locked", True)),
                 "anchor_type": _safe_text(item.get("anchor_type", "contact_onset")) or "contact_onset",
                 "source_task": _safe_text(item.get("source_task", "hoi")) or "hoi",

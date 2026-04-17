@@ -998,7 +998,7 @@ class TranscriptSegment:
 
 @dataclass
 class TranscriptTrack:
-    name: str  # Row title, e.g. "ASR: EN"
+    name: str  # Row title, e.g. "Transcript: EN"
     segments: list  # List[TranscriptSegment]
 
 
@@ -2080,7 +2080,7 @@ class CombinedTimelineRow(BaseTimelineRow):
                                 right_fill_label = default_fill
 
                         # Left trimmed span (start moved right): optionally fill to
-                        # avoid gaps in PSR no-gap mode.
+                        # avoid gaps when no-gap editing is enabled.
                         for f in range(old_s, min(s, old_e + 1)):
                             if self._label_at(f) != self._active_label:
                                 continue
@@ -2096,7 +2096,7 @@ class CombinedTimelineRow(BaseTimelineRow):
                                 st.remove_at(f)
 
                         # Right trimmed span (end moved left): optionally fill to
-                        # shift the adjacent boundary in PSR no-gap mode.
+                        # shift the adjacent boundary in no-gap mode.
                         for f in range(max(e_ + 1, old_s), old_e + 1):
                             if self._label_at(f) != self._active_label:
                                 continue

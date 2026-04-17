@@ -17,6 +17,7 @@ class OperationLogger:
         self.enabled = enabled
         self.max_rows = max(1, int(max_rows))
         self._rows: List[Dict[str, Any]] = []
+        self._dirty = False
         self.started_at = datetime.now().isoformat(timespec="seconds")
         self._started_dt = datetime.now()
         self.session_id = self._started_dt.strftime("%Y%m%dT%H%M%S")
@@ -46,6 +47,7 @@ class OperationLogger:
         for key, value in fields.items():
             row[str(key)] = self._serialize_value(value)
         self._rows.append(row)
+        self._dirty = True
         if len(self._rows) > self.max_rows:
             del self._rows[: len(self._rows) - self.max_rows]
 
@@ -64,9 +66,17 @@ class OperationLogger:
             writer.writeheader()
             for r in self._rows:
                 writer.writerow({k: r.get(k, "") for k in keys})
+        self._dirty = False
 
     def clear(self):
         self._rows.clear()
+        self._dirty = False
 
     def rows(self) -> List[Dict[str, Any]]:
         return [dict(row) for row in self._rows]
+
+    def is_dirty(self) -> bool:
+        return bool(self._dirty)
+
+    def has_rows(self) -> bool:
+        return bool(self._rows)

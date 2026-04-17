@@ -27,6 +27,7 @@ class HOITimelineRow(BaseTimelineRow):
         on_update: Callable[[int, str, int, int, int], None],
         on_create: Callable[[str, int, int, int], Optional[int]],
         on_delete: Callable[[int, str], None],
+        on_activate: Optional[Callable[[int, str], None]],
         on_hover: Callable[[int], None],
         get_frame_count: Callable[[], int],
         get_view_start: Callable[[], int],
@@ -46,6 +47,7 @@ class HOITimelineRow(BaseTimelineRow):
         self._on_update = on_update
         self._on_create = on_create
         self._on_delete = on_delete
+        self._on_activate = on_activate
         self._on_hover = on_hover
 
         self.setMouseTracking(True)
@@ -274,7 +276,7 @@ class HOITimelineRow(BaseTimelineRow):
             s, e_ = (start, end) if start <= end else (end, start)
             if not self._overlaps(s, e_, None):
                 self._preview_interval = (s, e_)
-                self._preview_onset = s + (e_ - s) // 2
+                self._preview_onset = s + ((e_ - s) // 2)
             self.update()
             return
 
@@ -315,6 +317,14 @@ class HOITimelineRow(BaseTimelineRow):
                     offset = self._active_onset - s0
                     self._preview_onset = max(s, min(s + offset, e_))
         self.update()
+
+    def leaveEvent(self, e):
+        if not self._dragging and self._hover_frame is not None:
+            self._hover_frame = None
+            self._on_hover(-1)
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+        super().leaveEvent(e)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.RightButton:
@@ -384,6 +394,24 @@ class HOITimelineRow(BaseTimelineRow):
         self._preview_onset = None
         self.update()
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() != Qt.LeftButton:
+            super().mouseDoubleClickEvent(e)
+            return
+        if e.x() < self.get_gutter():
+            return
+        seg, _where = self._hit_segment(e.x(), e.y())
+        if not seg:
+            return
+        event_id = seg.get("event_id")
+        if event_id is None:
+            return
+        self._on_select(event_id, self.hand_key)
+        if self._on_activate:
+            self._on_activate(event_id, self.hand_key)
+        e.accept()
+        return
+
 
 class HOITimeline(QWidget):
     """Multi-actor HOI timeline with dynamic row generation."""
@@ -399,6 +427,7 @@ class HOITimeline(QWidget):
         on_hover: Callable[[int], None],
         get_frame_count: Callable[[], int],
         get_fps: Callable[[], int],
+        on_activate: Optional[Callable[[int, str], None]] = None,
         get_title_for_hand: Optional[Callable[[str], str]] = None,
         actors_config: List[Dict] = None,
         parent=None,
@@ -410,6 +439,7 @@ class HOITimeline(QWidget):
         self._on_update = on_update
         self._on_create = on_create
         self._on_delete = on_delete
+        self._on_activate = on_activate
         self._on_hover = on_hover
         self._get_fc = get_frame_count
         self._get_fps = get_fps
@@ -496,6 +526,7 @@ class HOITimeline(QWidget):
                 self._on_update,
                 self._on_create,
                 self._on_delete,
+                self._on_activate,
                 self._on_hover,
                 self._get_fc,
                 self.get_view_start,
