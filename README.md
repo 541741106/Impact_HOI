@@ -353,7 +353,7 @@ Please check the original licenses of those dependencies before redistributing w
 
 ## Contact
 
-For questions about the paper or release, contact Kunyu Peng at `kunyu.peng@kit.edu`.
+For questions about the paper or release, contact Di Wen at `di.wen@kit.edu`.
 
 ## Citation
 
