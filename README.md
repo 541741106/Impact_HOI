@@ -5,7 +5,8 @@ IMPACT-HOI is a mixed-initiative annotation system for hand-object interaction (
 <div align="center">
   <h1>IMPACT-HOI</h1>
   <p>Supervisory Control for Onset-Anchored Partial HOI Event Construction</p>
-  <video src="./assets/Demo.mp4" width="100%" controls autoplay loop muted></video>
+
+  ![Demo Video](./assets/Demo.mp4)
 </div>
 
 ## Table of Contents
